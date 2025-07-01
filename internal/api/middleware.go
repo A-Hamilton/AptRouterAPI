@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -16,8 +17,10 @@ import (
 type contextKey string
 
 const (
-	loggerKey    contextKey = "logger"
-	requestIDKey contextKey = "request_id"
+	loggerKey         contextKey = "logger"
+	requestIDKey      contextKey = "request_id"
+	requestContextKey contextKey = "requestContext"
+	userCacheKey      contextKey = "userCache"
 )
 
 // RequestContext contains request-scoped data
@@ -27,6 +30,19 @@ type RequestContext struct {
 	APIKeyID    string
 	PricingTier pricing.PricingTier
 	Logger      *slog.Logger
+	// Cached user data for performance
+	CachedUser *CachedUserData
+}
+
+// CachedUserData contains frequently accessed user information
+type CachedUserData struct {
+	ID            string    `json:"id"`
+	Email         string    `json:"email"`
+	Balance       float64   `json:"balance"`
+	TierID        string    `json:"tier_id"`
+	IsActive      bool      `json:"is_active"`
+	CustomPricing bool      `json:"custom_pricing"`
+	LastUpdated   time.Time `json:"last_updated"`
 }
 
 // RequestLogger middleware generates a unique request_id and injects a request-scoped logger
@@ -136,15 +152,135 @@ func (h *Handler) getLogger(c *gin.Context) *slog.Logger {
 type ginContextKey string
 
 const (
-	requestContextKey ginContextKey = "request_context"
+	requestContextGinKey ginContextKey = "requestContext"
 )
 
 // getRequestContext gets the request context from Gin context
 func (h *Handler) getRequestContext(c *gin.Context) (*RequestContext, bool) {
-	if ctx, exists := c.Get(string(requestContextKey)); exists {
+	if ctx, exists := c.Get(string(requestContextGinKey)); exists {
 		if requestCtx, ok := ctx.(*RequestContext); ok {
 			return requestCtx, true
 		}
 	}
 	return nil, false
+}
+
+// getUserFromCache retrieves user data from cache or loads from Firebase
+func (h *Handler) getUserFromCache(ctx context.Context, userID string) (*CachedUserData, error) {
+	cacheKey := fmt.Sprintf("user:%s", userID)
+
+	// Try to get from cache first
+	if cached, found := h.cache.Get(cacheKey); found {
+		if userData, ok := cached.(*CachedUserData); ok {
+			// Check if cache is still valid (5 minutes)
+			if time.Since(userData.LastUpdated) < 5*time.Minute {
+				return userData, nil
+			}
+		}
+	}
+
+	// Cache miss or expired, load from Firebase
+	user, err := h.firebaseService.GetUserByID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user from Firebase: %w", err)
+	}
+
+	// Create cached user data
+	cachedUser := &CachedUserData{
+		ID:            user.ID,
+		Email:         user.Email,
+		Balance:       user.Balance,
+		TierID:        user.TierID,
+		IsActive:      user.IsActive,
+		CustomPricing: user.CustomPricing,
+		LastUpdated:   time.Now(),
+	}
+
+	// Store in cache for 5 minutes
+	h.cache.Set(cacheKey, cachedUser, 5*time.Minute)
+
+	return cachedUser, nil
+}
+
+// checkUserBalance performs a quick balance check before processing expensive operations
+func (h *Handler) checkUserBalance(ctx context.Context, userID string, estimatedCost float64) (bool, float64, error) {
+	// Get user from cache
+	cachedUser, err := h.getUserFromCache(ctx, userID)
+	if err != nil {
+		return false, 0, fmt.Errorf("failed to get user data: %w", err)
+	}
+
+	// Check if user is active
+	if !cachedUser.IsActive {
+		return false, cachedUser.Balance, fmt.Errorf("user account is inactive")
+	}
+
+	// Allow negative balance (graceful handling)
+	// Users can go into negative balance and it will be deducted from next purchase
+	return true, cachedUser.Balance, nil
+}
+
+// updateUserBalance updates user balance in both cache and Firebase
+func (h *Handler) updateUserBalance(ctx context.Context, userID string, amount float64) error {
+	// Update in Firebase first
+	err := h.firebaseService.UpdateUserBalance(ctx, userID, amount)
+	if err != nil {
+		return fmt.Errorf("failed to update user balance in Firebase: %w", err)
+	}
+
+	// Invalidate cache to force refresh on next request
+	cacheKey := fmt.Sprintf("user:%s", userID)
+	h.cache.Delete(cacheKey)
+
+	return nil
+}
+
+// getPricingTierFromCache retrieves pricing tier from cache or loads from Firebase
+func (h *Handler) getPricingTierFromCache(ctx context.Context, tierID string) (*pricing.PricingTier, error) {
+	cacheKey := fmt.Sprintf("tier:%s", tierID)
+
+	// Try to get from cache first
+	if cached, found := h.cache.Get(cacheKey); found {
+		if tier, ok := cached.(*pricing.PricingTier); ok {
+			return tier, nil
+		}
+	}
+
+	// Cache miss, load from Firebase
+	firebaseTier, err := h.firebaseService.GetPricingTier(ctx, tierID)
+	if err != nil {
+		// Fallback to default tier
+		firebaseTier, err = h.firebaseService.GetDefaultPricingTier(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get pricing tier: %w", err)
+		}
+	}
+
+	// Convert Firebase ModelPricing to pricing.ModelPricing
+	customModelPricing := make(map[string]pricing.ModelPricing)
+	for modelID, modelPricing := range firebaseTier.CustomModelPricing {
+		customModelPricing[modelID] = pricing.ModelPricing{
+			ModelID:               modelPricing.ModelID,
+			Provider:              modelPricing.Provider,
+			InputPricePerMillion:  modelPricing.InputPricePerMillion,
+			OutputPricePerMillion: modelPricing.OutputPricePerMillion,
+		}
+	}
+
+	// Create pricing tier
+	tier := &pricing.PricingTier{
+		ID:                  firebaseTier.ID,
+		TierName:            firebaseTier.Name,
+		MinMonthlySpend:     firebaseTier.MinMonthlySpend,
+		InputMarkupPercent:  firebaseTier.InputMarkupPercent,
+		OutputMarkupPercent: firebaseTier.OutputMarkupPercent,
+		IsActive:            firebaseTier.IsActive,
+		IsCustom:            firebaseTier.IsCustom,
+		CustomModelPricing:  customModelPricing,
+	}
+
+	// Store in cache for 10 minutes (pricing tiers change less frequently)
+	h.cache.Set(cacheKey, tier, 10*time.Minute)
+
+	return tier, nil
 }

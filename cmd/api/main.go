@@ -11,10 +11,10 @@ import (
 
 	"github.com/apt-router/api/internal/api"
 	"github.com/apt-router/api/internal/config"
+	"github.com/apt-router/api/internal/firebase"
 	"github.com/apt-router/api/internal/pricing"
 	"github.com/gin-gonic/gin"
 	"github.com/patrickmn/go-cache"
-	supabase "github.com/supabase-community/supabase-go"
 )
 
 // main is the entry point for the AptRouter API server
@@ -35,10 +35,10 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Initialize Supabase client with timeout
-	supabaseClient, err := initSupabaseClient(cfg)
+	// Initialize Firebase service with timeout
+	firebaseService, err := initFirebaseService(cfg)
 	if err != nil {
-		slog.Error("Failed to initialize Supabase client", "error", err)
+		slog.Error("Failed to initialize Firebase service", "error", err)
 		os.Exit(1)
 	}
 
@@ -46,7 +46,7 @@ func main() {
 	memoryCache := cache.New(cfg.Cache.DefaultExpiration, cfg.Cache.CleanupInterval)
 
 	// Initialize pricing service and pre-cache data with timeout
-	pricingService := pricing.NewService(supabaseClient)
+	pricingService := pricing.NewService(firebaseService)
 	pricingCtx, pricingCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer pricingCancel()
 
@@ -65,7 +65,7 @@ func main() {
 	router.Use(gin.Recovery())
 
 	// Initialize API handlers
-	apiHandler := api.NewHandler(cfg, supabaseClient, memoryCache, pricingService)
+	apiHandler := api.NewHandler(cfg, firebaseService, memoryCache, pricingService)
 
 	// Add request logging middleware
 	router.Use(apiHandler.RequestLogger())
@@ -142,29 +142,37 @@ func initLogger(cfg *config.Config) *slog.Logger {
 	return slog.New(handler)
 }
 
-// initSupabaseClient initializes the Supabase client with timeout
-func initSupabaseClient(cfg *config.Config) (*supabase.Client, error) {
-	// Create client with timeout context
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+// initFirebaseService initializes the Firebase service with timeout
+func initFirebaseService(cfg *config.Config) (*firebase.Service, error) {
+	// Create Firebase config
+	firebaseConfig := &firebase.FirebaseConfig{
+		ProjectID:          cfg.Firebase.ProjectID,
+		ServiceAccountPath: cfg.Firebase.ServiceAccountPath,
+		UseCLIAuth:         cfg.Firebase.UseCLIAuth,
+	}
 
-	client, err := supabase.NewClient(cfg.Supabase.URL, cfg.Supabase.ServiceRoleKey, nil)
+	// Initialize Firebase service
+	service, err := firebase.NewService(firebaseConfig)
 	if err != nil {
 		return nil, err
 	}
 
 	// Test connection
-	if err := testSupabaseConnection(ctx, client); err != nil {
+	if err := testFirebaseConnection(context.Background(), service); err != nil {
 		return nil, err
 	}
 
-	return client, nil
+	return service, nil
 }
 
-// testSupabaseConnection tests the Supabase connection
-func testSupabaseConnection(ctx context.Context, client *supabase.Client) error {
-	// Simple health check - in production, you might want to test a specific table
-	// For now, we'll just return nil as the client creation is sufficient
+// testFirebaseConnection tests the Firebase connection
+func testFirebaseConnection(ctx context.Context, service *firebase.Service) error {
+	// Simple health check - try to get default pricing tier
+	_, err := service.GetDefaultPricingTier(ctx)
+	if err != nil {
+		// Log warning but don't fail - this might be expected if no tiers exist yet
+		slog.Warn("Firebase connection test failed (this is normal if no pricing tiers exist yet)", "error", err)
+	}
 	return nil
 }
 

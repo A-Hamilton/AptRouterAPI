@@ -3,17 +3,16 @@ package config
 import (
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/spf13/viper"
 	"github.com/subosito/gotenv"
 )
 
-// Config holds all configuration for the AptRouter API
+// Config holds all configuration for the application
 type Config struct {
 	Server       ServerConfig       `mapstructure:"server"`
-	Supabase     SupabaseConfig     `mapstructure:"supabase"`
+	Firebase     FirebaseConfig     `mapstructure:"firebase"`
 	Cache        CacheConfig        `mapstructure:"cache"`
 	LLM          LLMConfig          `mapstructure:"llm"`
 	Security     SecurityConfig     `mapstructure:"security"`
@@ -29,11 +28,17 @@ type ServerConfig struct {
 	Env  string `mapstructure:"env"`
 }
 
-// SupabaseConfig holds Supabase-related configuration
-type SupabaseConfig struct {
-	URL            string `mapstructure:"url"`
-	ServiceRoleKey string `mapstructure:"service_role_key"`
-	AnonKey        string `mapstructure:"anon_key"`
+// FirebaseConfig holds Firebase configuration
+type FirebaseConfig struct {
+	ProjectID          string `mapstructure:"project_id"`
+	ServiceAccountPath string `mapstructure:"service_account_path"`
+	WebAPIKey          string `mapstructure:"web_api_key"`
+	AuthDomain         string `mapstructure:"auth_domain"`
+	StorageBucket      string `mapstructure:"storage_bucket"`
+	MessagingSenderID  string `mapstructure:"messaging_sender_id"`
+	AppID              string `mapstructure:"app_id"`
+	MeasurementID      string `mapstructure:"measurement_id"`
+	UseCLIAuth         bool   `mapstructure:"use_cli_auth"`
 }
 
 // CacheConfig holds cache-related configuration
@@ -55,7 +60,7 @@ type SecurityConfig struct {
 	APIKeySalt string `mapstructure:"api_key_salt"`
 }
 
-// LoggingConfig holds logging-related configuration
+// LoggingConfig holds logging configuration
 type LoggingConfig struct {
 	Level  string `mapstructure:"level"`
 	Format string `mapstructure:"format"`
@@ -67,136 +72,157 @@ type RateLimitConfig struct {
 	Burst             int `mapstructure:"burst"`
 }
 
-// CostConfig holds cost management configuration
+// CostConfig holds cost-related configuration
 type CostConfig struct {
 	MaxCostPerRequestUSD  float64 `mapstructure:"max_cost_per_request_usd"`
 	DefaultUserBalanceUSD float64 `mapstructure:"default_user_balance_usd"`
 }
 
-// OptimizationConfig holds optimization-related configuration
+// OptimizationConfig holds optimization configuration
 type OptimizationConfig struct {
 	Enabled                       bool `mapstructure:"enabled"`
 	FallbackOnOptimizationFailure bool `mapstructure:"fallback_on_optimization_failure"`
 }
 
-// LoadConfig loads configuration from environment variables and .env file
+// LoadConfig loads configuration from environment variables and config files
 func LoadConfig() (*Config, error) {
-	// Load .env file if present (ignore errors if file doesn't exist)
-	_ = gotenv.Load()
+	// Load .env file if it exists
+	if err := gotenv.Load(); err != nil {
+		// .env file is optional, so we don't return an error
+	}
 
-	// Set default values first
-	setDefaults()
-
-	// Configure Viper to read environment variables
-	viper.AutomaticEnv()
-
-	// Map environment variables to config structure
-	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-
-	// Bind environment variables to config fields
+	// Bind environment variables
 	bindEnvVars()
 
-	var config Config
-	if err := viper.Unmarshal(&config); err != nil {
+	// Set defaults
+	setDefaults()
+
+	// Create config instance
+	config := &Config{}
+
+	// Unmarshal configuration
+	if err := viper.Unmarshal(config); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
-	// Validate required fields
-	if err := validateConfig(&config); err != nil {
-		return nil, fmt.Errorf("config validation failed: %w", err)
+	// Validate configuration
+	if err := validateConfig(config); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
-	return &config, nil
+	return config, nil
 }
 
-// bindEnvVars binds environment variables to config fields
+// bindEnvVars binds environment variables to viper
 func bindEnvVars() {
-	// Server config
+	// Server
 	viper.BindEnv("server.port", "PORT")
 	viper.BindEnv("server.env", "ENV")
 
-	// Supabase config
-	viper.BindEnv("supabase.url", "SUPABASE_URL")
-	viper.BindEnv("supabase.service_role_key", "SUPABASE_SERVICE_ROLE_KEY")
-	viper.BindEnv("supabase.anon_key", "SUPABASE_ANON_KEY")
+	// Firebase
+	viper.BindEnv("firebase.project_id", "FIREBASE_PROJECT_ID")
+	viper.BindEnv("firebase.service_account_path", "FIREBASE_SERVICE_ACCOUNT_PATH")
+	viper.BindEnv("firebase.web_api_key", "FIREBASE_WEB_API_KEY")
+	viper.BindEnv("firebase.auth_domain", "FIREBASE_AUTH_DOMAIN")
+	viper.BindEnv("firebase.storage_bucket", "FIREBASE_STORAGE_BUCKET")
+	viper.BindEnv("firebase.messaging_sender_id", "FIREBASE_MESSAGING_SENDER_ID")
+	viper.BindEnv("firebase.app_id", "FIREBASE_APP_ID")
+	viper.BindEnv("firebase.measurement_id", "FIREBASE_MEASUREMENT_ID")
+	viper.BindEnv("firebase.use_cli_auth", "FIREBASE_USE_CLI_AUTH")
 
-	// Cache config
-	viper.BindEnv("cache.default_expiration", "CACHE_DEFAULT_EXPIRATION")
-	viper.BindEnv("cache.cleanup_interval", "CACHE_CLEANUP_INTERVAL")
-
-	// LLM config
+	// LLM API Keys
 	viper.BindEnv("llm.google_api_key", "GOOGLE_API_KEY")
 	viper.BindEnv("llm.openai_api_key", "OPENAI_API_KEY")
 	viper.BindEnv("llm.anthropic_api_key", "ANTHROPIC_API_KEY")
 
-	// Security config
+	// Security
 	viper.BindEnv("security.jwt_secret", "JWT_SECRET")
 	viper.BindEnv("security.api_key_salt", "API_KEY_SALT")
 
-	// Logging config
+	// Logging
 	viper.BindEnv("logging.level", "LOG_LEVEL")
 	viper.BindEnv("logging.format", "LOG_FORMAT")
 
-	// Rate limit config
+	// Rate Limiting
 	viper.BindEnv("rate_limit.requests_per_minute", "RATE_LIMIT_REQUESTS_PER_MINUTE")
 	viper.BindEnv("rate_limit.burst", "RATE_LIMIT_BURST")
 
-	// Cost config
+	// Cost
 	viper.BindEnv("cost.max_cost_per_request_usd", "MAX_COST_PER_REQUEST_USD")
 	viper.BindEnv("cost.default_user_balance_usd", "DEFAULT_USER_BALANCE_USD")
 
-	// Optimization config
+	// Optimization
 	viper.BindEnv("optimization.enabled", "OPTIMIZATION_ENABLED")
-	viper.BindEnv("optimization.fallback_on_optimization_failure", "FALLBACK_ON_OPTIMIZATION_FAILURE")
+	viper.BindEnv("optimization.fallback_on_optimization_failure", "OPTIMIZATION_FALLBACK_ON_FAILURE")
 }
 
 // setDefaults sets default values for configuration
 func setDefaults() {
 	// Server defaults
-	viper.SetDefault("PORT", "8080")
-	viper.SetDefault("ENV", "development")
+	viper.SetDefault("server.port", 8080)
+	viper.SetDefault("server.env", "development")
+
+	// Firebase defaults (will be overridden by environment variables)
+	viper.SetDefault("firebase.project_id", "aptrouter-44552")
 
 	// Cache defaults
-	viper.SetDefault("CACHE_DEFAULT_EXPIRATION", "5m")
-	viper.SetDefault("CACHE_CLEANUP_INTERVAL", "10m")
+	viper.SetDefault("cache.default_expiration", 5*time.Minute)
+	viper.SetDefault("cache.cleanup_interval", 10*time.Minute)
+
+	// Security defaults
+	viper.SetDefault("security.jwt_secret", "your-jwt-secret-change-in-production")
+	viper.SetDefault("security.api_key_salt", "your-api-key-salt-change-in-production")
 
 	// Logging defaults
-	viper.SetDefault("LOG_LEVEL", "info")
-	viper.SetDefault("LOG_FORMAT", "json")
+	viper.SetDefault("logging.level", "info")
+	viper.SetDefault("logging.format", "json")
 
 	// Rate limiting defaults
-	viper.SetDefault("RATE_LIMIT_REQUESTS_PER_MINUTE", "100")
-	viper.SetDefault("RATE_LIMIT_BURST", "20")
+	viper.SetDefault("rate_limit.requests_per_minute", 60)
+	viper.SetDefault("rate_limit.burst", 10)
 
-	// Cost management defaults
-	viper.SetDefault("MAX_COST_PER_REQUEST_USD", "10.00")
-	viper.SetDefault("DEFAULT_USER_BALANCE_USD", "100.00")
+	// Cost defaults
+	viper.SetDefault("cost.max_cost_per_request_usd", 10.0)
+	viper.SetDefault("cost.default_user_balance_usd", 100.0)
 
 	// Optimization defaults
-	viper.SetDefault("OPTIMIZATION_ENABLED", "true")
-	viper.SetDefault("FALLBACK_ON_OPTIMIZATION_FAILURE", "true")
+	viper.SetDefault("optimization.enabled", true)
+	viper.SetDefault("optimization.fallback_on_optimization_failure", true)
 }
 
-// validateConfig validates that all required configuration fields are present
+// validateConfig validates the configuration
 func validateConfig(config *Config) error {
-	requiredFields := []struct {
-		name  string
-		value string
-	}{
-		{"SUPABASE_URL", config.Supabase.URL},
-		{"SUPABASE_SERVICE_ROLE_KEY", config.Supabase.ServiceRoleKey},
-		{"SUPABASE_ANON_KEY", config.Supabase.AnonKey},
-		{"JWT_SECRET", config.Security.JWTSecret},
-		{"API_KEY_SALT", config.Security.APIKeySalt},
-		{"GOOGLE_API_KEY", config.LLM.GoogleAPIKey},
-		{"OPENAI_API_KEY", config.LLM.OpenAIAPIKey},
-		{"ANTHROPIC_API_KEY", config.LLM.AnthropicAPIKey},
+	// Validate server port
+	if config.Server.Port <= 0 || config.Server.Port > 65535 {
+		return fmt.Errorf("invalid server port: %d", config.Server.Port)
 	}
 
-	for _, field := range requiredFields {
-		if field.value == "" {
-			return fmt.Errorf("%s is required", field.name)
-		}
+	// Validate Firebase configuration
+	if config.Firebase.ProjectID == "" {
+		return fmt.Errorf("firebase project ID is required")
+	}
+
+	// Validate required API keys (at least one should be present)
+	if config.LLM.GoogleAPIKey == "" && config.LLM.OpenAIAPIKey == "" && config.LLM.AnthropicAPIKey == "" {
+		return fmt.Errorf("at least one LLM API key is required")
+	}
+
+	// Validate security configuration
+	if config.Security.JWTSecret == "" {
+		return fmt.Errorf("JWT secret is required")
+	}
+
+	if config.Security.APIKeySalt == "" {
+		return fmt.Errorf("API key salt is required")
+	}
+
+	// Validate cost configuration
+	if config.Cost.MaxCostPerRequestUSD <= 0 {
+		return fmt.Errorf("max cost per request must be positive")
+	}
+
+	if config.Cost.DefaultUserBalanceUSD <= 0 {
+		return fmt.Errorf("default user balance must be positive")
 	}
 
 	return nil

@@ -14,8 +14,11 @@ import (
 
 // TestRequest represents a test request
 type TestRequest struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
+	Model           string `json:"model"`
+	Prompt          string `json:"prompt"`
+	OpenAIAPIKey    string `json:"openai_api_key,omitempty"`
+	GoogleAPIKey    string `json:"google_api_key,omitempty"`
+	AnthropicAPIKey string `json:"anthropic_api_key,omitempty"`
 }
 
 // TestResponse represents a test response
@@ -63,11 +66,11 @@ func main() {
 	// Configuration
 	config := TestConfig{
 		BaseURL: "http://localhost:8080",
-		APIKey:  "test-api-key",
+		APIKey:  "test-api-key-hash",
 		Models: map[string]string{
-			"openai":    "gpt-3.5-turbo",
+			"openai":    "gpt-4o-2024-05-13",
 			"google":    "gemini-2.0-flash",
-			"anthropic": "claude-3-haiku-20240307",
+			"anthropic": "claude-3-5-haiku-20241022",
 		},
 		TestPrompt: "Write a short, friendly greeting in exactly 2 sentences.",
 		Timeout:    30 * time.Second,
@@ -79,6 +82,20 @@ func main() {
 	}
 	if apiKey := os.Getenv("API_KEY"); apiKey != "" {
 		config.APIKey = apiKey
+	}
+
+	// Get BYOK keys from env
+	openaiKey := os.Getenv("OPENAI_API_KEY")
+	if openaiKey == "" {
+		openaiKey = "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"
+	}
+	googleKey := os.Getenv("GOOGLE_API_KEY")
+	if googleKey == "" {
+		googleKey = "dummy-google-key"
+	}
+	anthropicKey := os.Getenv("ANTHROPIC_API_KEY")
+	if anthropicKey == "" {
+		anthropicKey = "dummy-anthropic-key"
 	}
 
 	fmt.Printf("🚀 Starting E2E Tests for AptRouter API\n")
@@ -96,7 +113,7 @@ func main() {
 		fmt.Printf("\nTesting %s with model %s...\n", provider, model)
 
 		// Test non-streaming
-		result := testNonStreaming(config, provider, model)
+		result := testNonStreaming(config, provider, model, openaiKey, googleKey, anthropicKey)
 		results = append(results, result)
 
 		if result.Success {
@@ -120,7 +137,7 @@ func main() {
 		fmt.Printf("\nTesting %s with model %s...\n", provider, model)
 
 		// Test streaming
-		result := testStreaming(config, provider, model)
+		result := testStreaming(config, provider, model, openaiKey, googleKey, anthropicKey)
 		results = append(results, result)
 
 		if result.Success {
@@ -141,13 +158,22 @@ func main() {
 	printSummary(results)
 }
 
-func testNonStreaming(config TestConfig, provider, model string) TestResult {
+func testNonStreaming(config TestConfig, provider, model, openaiKey, googleKey, anthropicKey string) TestResult {
 	start := time.Now()
 
 	// Create request
 	reqBody := TestRequest{
 		Model:  model,
 		Prompt: config.TestPrompt,
+	}
+	if provider == "openai" {
+		reqBody.OpenAIAPIKey = openaiKey
+	}
+	if provider == "google" {
+		reqBody.GoogleAPIKey = googleKey
+	}
+	if provider == "anthropic" {
+		reqBody.AnthropicAPIKey = anthropicKey
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -244,13 +270,22 @@ func testNonStreaming(config TestConfig, provider, model string) TestResult {
 	}
 }
 
-func testStreaming(config TestConfig, provider, model string) TestResult {
+func testStreaming(config TestConfig, provider, model, openaiKey, googleKey, anthropicKey string) TestResult {
 	start := time.Now()
 
 	// Create request
 	reqBody := TestRequest{
 		Model:  model,
 		Prompt: config.TestPrompt,
+	}
+	if provider == "openai" {
+		reqBody.OpenAIAPIKey = openaiKey
+	}
+	if provider == "google" {
+		reqBody.GoogleAPIKey = googleKey
+	}
+	if provider == "anthropic" {
+		reqBody.AnthropicAPIKey = anthropicKey
 	}
 
 	jsonBody, err := json.Marshal(reqBody)

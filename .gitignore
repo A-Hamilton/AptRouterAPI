@@ -30,6 +30,8 @@ go.work.sum
 
 *.ps1
 
+firestore-credentials.json
+
 # Editor/IDE
 # .idea/
 # .vscode/

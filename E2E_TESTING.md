@@ -4,23 +4,23 @@ This document describes how to run comprehensive end-to-end tests for the AptRou
 
 ## Overview
 
-The e2e testing suite tests all three LLM providers (OpenAI, Google Gemini, Anthropic) with cheap/fast models for both non-streaming and streaming endpoints.
+The e2e testing suite tests all three LLM providers (OpenAI, Google Gemini, Anthropic) with cheap/fast models for both non-streaming and streaming endpoints. **BYOK (Bring Your Own Key) is now required for all providers.**
 
 ## Test Models
 
 The tests use the following cost-effective models:
 
-- **OpenAI**: `gpt-3.5-turbo` - Fast and affordable GPT model
+- **OpenAI**: `gpt-4o-2024-05-13` - Fast and affordable GPT model
 - **Google**: `gemini-2.0-flash` - Fast and efficient Gemini model  
-- **Anthropic**: `claude-3-haiku-20240307` - Fast and cost-effective Claude model
+- **Anthropic**: `claude-3-5-haiku-20241022` - Fast and cost-effective Claude model
 
 ## Prerequisites
 
 1. **Go 1.24+** installed and in PATH
 2. **API Keys** configured in environment variables:
-   - `OPENAI_API_KEY`
-   - `GOOGLE_API_KEY` 
-   - `ANTHROPIC_API_KEY`
+   - `OPENAI_API_KEY` (required for OpenAI tests)
+   - `GOOGLE_API_KEY` (required for Google Gemini tests)
+   - `ANTHROPIC_API_KEY` (required for Anthropic Claude tests)
 3. **Server running** on `http://localhost:8080` (or configure `API_BASE_URL`)
 
 ## Running Tests
@@ -29,23 +29,28 @@ The tests use the following cost-effective models:
 
 ```powershell
 # Run tests against running server
-.\run-e2e-tests.ps1
-
-# Run tests and start/stop server automatically
-.\run-e2e-tests.ps1 -StartServer -StopServer
-
-# Run tests against different server
-.\run-e2e-tests.ps1 -ApiBaseUrl "http://localhost:9000"
+$env:OPENAI_API_KEY="sk-proj-..."; $env:GOOGLE_API_KEY="..."; $env:ANTHROPIC_API_KEY="..."; .\run-e2e-tests.ps1
 ```
 
 ### Option 2: Direct Go Command
 
 ```bash
 # Run tests directly
-go run test-e2e.go
+OPENAI_API_KEY="sk-proj-..." GOOGLE_API_KEY="..." ANTHROPIC_API_KEY="..." go run test-e2e.go
+```
 
-# With custom environment variables
-API_BASE_URL="http://localhost:9000" API_KEY="custom-key" go run test-e2e.go
+## Test Request Format (BYOK)
+
+All test requests now include the provider API key in the request body:
+
+```
+{
+  "model": "gpt-4o-2024-05-13",
+  "prompt": "Write a short, friendly greeting in exactly 2 sentences.",
+  "openai_api_key": "sk-proj-...", // for OpenAI
+  "google_api_key": "...",         // for Google
+  "anthropic_api_key": "..."       // for Anthropic
+}
 ```
 
 ## Test Coverage
@@ -53,13 +58,13 @@ API_BASE_URL="http://localhost:9000" API_KEY="custom-key" go run test-e2e.go
 The e2e tests cover:
 
 ### Non-Streaming Endpoints
-- ✅ `/v1/generate` with all three providers
+- ✅ `/v1/generate` with all three providers (BYOK required)
 - ✅ Response parsing and validation
 - ✅ Token usage tracking
 - ✅ Cost calculation
 
 ### Streaming Endpoints  
-- ✅ `/v1/generate/stream` with all three providers
+- ✅ `/v1/generate/stream` with all three providers (BYOK required)
 - ✅ Real-time streaming response handling
 - ✅ Stream completion detection
 - ✅ Response content validation
@@ -107,7 +112,10 @@ Success Rate: 100.0%
 ### Environment Variables
 
 - `API_BASE_URL`: API server URL (default: `http://localhost:8080`)
-- `API_KEY`: API key for authentication (default: `test-api-key`)
+- `API_KEY`: API key for authentication (default: `test-api-key-hash`)
+- `OPENAI_API_KEY`: OpenAI API key (required for OpenAI tests)
+- `GOOGLE_API_KEY`: Google Gemini API key (required for Google tests)
+- `ANTHROPIC_API_KEY`: Anthropic Claude API key (required for Anthropic tests)
 
 ### Test Parameters
 
@@ -135,9 +143,9 @@ Success Rate: 100.0%
 3. **Model not found**
    ```
    ❌ Some E2E tests failed  
-   Error: model config not found for model ID: gpt-3.5-turbo
+   Error: model config not found for model ID: gpt-4o-2024-05-13
    ```
-   Solution: Check that models are configured in `internal/pricing/service.go`
+   Solution: Check that models are configured in Firestore
 
 ### Debug Mode
 
@@ -151,13 +159,7 @@ The e2e tests can be integrated into CI/CD pipelines:
 # Example GitHub Actions step
 - name: Run E2E Tests
   run: |
-    go run cmd/api/main.go &
-    sleep 10
-    go run test-e2e.go
-  env:
-    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-    GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-    ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }} GOOGLE_API_KEY=${{ secrets.GOOGLE_API_KEY }} ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }} go run test-e2e.go
 ```
 
 ## Performance Benchmarks
@@ -166,8 +168,8 @@ Typical response times for the test models:
 
 | Provider | Model | Non-Streaming | Streaming |
 |----------|-------|---------------|-----------|
-| OpenAI | gpt-3.5-turbo | ~2.0s | ~2.1s |
+| OpenAI | gpt-4o-2024-05-13 | ~2.0s | ~2.1s |
 | Google | gemini-2.0-flash | ~0.7s | ~0.5s |
-| Anthropic | claude-3-haiku | ~1.2s | ~0.8s |
+| Anthropic | claude-3-5-haiku-20241022 | ~1.2s | ~0.8s |
 
 *Note: Response times may vary based on network conditions and API availability.* 

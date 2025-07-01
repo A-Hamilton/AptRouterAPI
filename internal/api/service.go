@@ -9,25 +9,25 @@ import (
 	"time"
 
 	"github.com/apt-router/api/internal/config"
+	"github.com/apt-router/api/internal/firebase"
 	"github.com/apt-router/api/internal/llm"
 	"github.com/apt-router/api/internal/pricing"
 	"github.com/patrickmn/go-cache"
-	supabase "github.com/supabase-community/supabase-go"
 )
 
 // GenerationService handles the business logic for text generation
 type GenerationService struct {
-	config         *config.Config
-	supabaseClient *supabase.Client
-	cache          *cache.Cache
-	pricingService *pricing.Service
-	optimizer      *llm.Optimizer
+	config          *config.Config
+	firebaseService *firebase.Service
+	cache           *cache.Cache
+	pricingService  *pricing.Service
+	optimizer       *llm.Optimizer
 }
 
 // NewGenerationService creates a new generation service
 func NewGenerationService(
 	cfg *config.Config,
-	supabaseClient *supabase.Client,
+	firebaseService *firebase.Service,
 	cache *cache.Cache,
 	pricingService *pricing.Service,
 ) *GenerationService {
@@ -40,11 +40,11 @@ func NewGenerationService(
 	}
 
 	return &GenerationService{
-		config:         cfg,
-		supabaseClient: supabaseClient,
-		cache:          cache,
-		pricingService: pricingService,
-		optimizer:      optimizer,
+		config:          cfg,
+		firebaseService: firebaseService,
+		cache:           cache,
+		pricingService:  pricingService,
+		optimizer:       optimizer,
 	}
 }
 
@@ -106,6 +106,8 @@ type EnhancedStreamReader struct {
 	promptOptimizationResult *llm.OptimizationResult
 	closed                   bool
 	usageLogged              bool
+	generationService        *GenerationService
+	startTime                time.Time
 }
 
 func (r *EnhancedStreamReader) Read(p []byte) (n int, err error) {
@@ -157,8 +159,8 @@ func (r *EnhancedStreamReader) logUsage() {
 		}
 	}
 
-	// Calculate cost
-	cost := r.calculateCost(r.inputTokens, r.outputTokens)
+	// Calculate actual cost based on real token usage
+	actualCost := r.calculateActualCost(r.inputTokens, r.outputTokens)
 
 	// Log the streaming request with usage information
 	r.requestCtx.Logger.Info("Streaming request completed with usage",
@@ -168,63 +170,88 @@ func (r *EnhancedStreamReader) logUsage() {
 		"input_tokens", r.inputTokens,
 		"output_tokens", r.outputTokens,
 		"total_tokens", r.inputTokens+r.outputTokens,
-		"cost", cost,
+		"actual_cost", actualCost,
 		"was_optimized", r.wasOptimized,
 		"optimization_status", r.optimizationStatus,
 		"fallback_reason", r.fallbackReason,
 	)
 
-	// Log request to database (simplified for streaming)
-	r.logStreamingRequest(cost)
+	// Log request to database
+	r.logStreamingRequest(actualCost)
 
-	// Charge the user
-	r.chargeUser(cost)
+	// Charge the user (allows negative balance)
+	r.chargeUser(actualCost)
 }
 
-func (r *EnhancedStreamReader) calculateCost(inputTokens, outputTokens int) float64 {
+func (r *EnhancedStreamReader) calculateActualCost(inputTokens, outputTokens int) float64 {
 	// Calculate base cost
 	inputCost := float64(inputTokens) * r.modelConfig.InputPricePerMillion / 1000000
 	outputCost := float64(outputTokens) * r.modelConfig.OutputPricePerMillion / 1000000
 	baseCost := inputCost + outputCost
 
-	// Apply pricing tier discounts
-	inputSavings := float64(inputTokens) * r.requestCtx.PricingTier.InputSavingsRateUSDPerMillion / 1000000
-	outputSavings := float64(outputTokens) * r.requestCtx.PricingTier.OutputSavingsRateUSDPerMillion / 1000000
-	totalSavings := inputSavings + outputSavings
+	// Apply pricing tier markups (percentage-based)
+	inputMarkup := inputCost * (r.requestCtx.PricingTier.InputMarkupPercent / 100)
+	outputMarkup := outputCost * (r.requestCtx.PricingTier.OutputMarkupPercent / 100)
+	totalMarkup := inputMarkup + outputMarkup
 
-	finalCost := baseCost - totalSavings
-	if finalCost < 0 {
-		finalCost = 0
-	}
+	finalCost := baseCost + totalMarkup
 
 	return finalCost
 }
 
 func (r *EnhancedStreamReader) logStreamingRequest(cost float64) {
-	// TODO: Implement database logging using Supabase
-	// For now, just log to console
-	r.requestCtx.Logger.Info("Streaming request logged",
-		"user_id", r.requestCtx.UserID,
-		"model", r.modelConfig.ModelID,
-		"input_tokens", r.inputTokens,
-		"output_tokens", r.outputTokens,
-		"cost", cost,
-		"was_optimized", r.wasOptimized,
-		"optimization_status", r.optimizationStatus,
-		"fallback_reason", r.fallbackReason,
-	)
+	// Create request log entry
+	requestLog := &firebase.RequestLog{
+		ID:                 fmt.Sprintf("req_%d", time.Now().UnixNano()),
+		UserID:             r.requestCtx.UserID,
+		APIKeyID:           r.requestCtx.APIKeyID,
+		RequestID:          r.requestCtx.RequestID,
+		ModelID:            r.modelConfig.ModelID,
+		Provider:           r.modelConfig.Provider,
+		InputTokens:        r.inputTokens,
+		OutputTokens:       r.outputTokens,
+		TotalTokens:        r.inputTokens + r.outputTokens,
+		BaseCost:           cost / (1 + (r.requestCtx.PricingTier.InputMarkupPercent+r.requestCtx.PricingTier.OutputMarkupPercent)/100),
+		MarkupAmount:       cost - (cost / (1 + (r.requestCtx.PricingTier.InputMarkupPercent+r.requestCtx.PricingTier.OutputMarkupPercent)/100)),
+		TotalCost:          cost,
+		TierID:             r.requestCtx.PricingTier.ID,
+		MarkupPercent:      (r.requestCtx.PricingTier.InputMarkupPercent + r.requestCtx.PricingTier.OutputMarkupPercent) / 2,
+		WasOptimized:       r.wasOptimized,
+		OptimizationStatus: r.optimizationStatus,
+		TokensSaved:        0, // Will be calculated if optimization was used
+		SavingsAmount:      0, // Will be calculated if optimization was used
+		Streaming:          true,
+		RequestTimestamp:   r.startTime,
+		ResponseTimestamp:  time.Now(),
+		DurationMs:         time.Since(r.startTime).Milliseconds(),
+		Status:             "success",
+		IPAddress:          "127.0.0.1", // Will be set from request context
+		UserAgent:          "streaming-client",
+		Metadata:           map[string]interface{}{"streaming": true},
+	}
+
+	// Log to Firebase using the generation service
+	err := r.generationService.firebaseService.LogRequest(context.Background(), requestLog)
+	if err != nil {
+		r.requestCtx.Logger.Error("Failed to log streaming request to Firebase", "error", err)
+	}
 }
 
 func (r *EnhancedStreamReader) chargeUser(cost float64) {
-	// TODO: Implement database charging using Supabase
-	// For now, just log to console
-	r.requestCtx.Logger.Info("User charged for streaming",
-		"user_id", r.requestCtx.UserID,
-		"cost", cost,
-	)
+	// Update user balance (allows negative balance) using the generation service
+	err := r.generationService.firebaseService.UpdateUserBalance(context.Background(), r.requestCtx.UserID, -cost)
+	if err != nil {
+		r.requestCtx.Logger.Error("Failed to charge user for streaming", "error", err, "user_id", r.requestCtx.UserID, "cost", cost)
+	} else {
+		r.requestCtx.Logger.Info("User charged for streaming",
+			"user_id", r.requestCtx.UserID,
+			"cost", cost,
+			"balance_deducted", cost,
+		)
+	}
 }
 
-// Generate handles the main generation logic
+// Generate handles the main generation logic with optimized billing
 func (s *GenerationService) Generate(ctx context.Context, req *GenerationRequest, requestCtx *RequestContext) (*GenerationResult, error) {
 	// Validate model
 	if req.Model == "" {
@@ -247,6 +274,28 @@ func (s *GenerationService) Generate(ctx context.Context, req *GenerationRequest
 	if req.TopP == 0 {
 		req.TopP = 1.0
 	}
+
+	// Pre-flight balance check (quick cache check before expensive operations)
+	estimatedInputTokens := len(req.Prompt) / 4 // Rough estimate
+	estimatedOutputTokens := req.MaxTokens
+	estimatedCost := s.calculateEstimatedCost(estimatedInputTokens, estimatedOutputTokens, modelConfig, requestCtx.PricingTier)
+
+	canProceed, currentBalance, err := s.checkUserBalance(ctx, requestCtx.UserID, estimatedCost)
+	if err != nil {
+		return nil, fmt.Errorf("balance check failed: %w", err)
+	}
+
+	if !canProceed {
+		return nil, fmt.Errorf("user account is inactive")
+	}
+
+	requestCtx.Logger.Info("Pre-flight balance check passed",
+		"user_id", requestCtx.UserID,
+		"current_balance", currentBalance,
+		"estimated_cost", estimatedCost,
+		"estimated_input_tokens", estimatedInputTokens,
+		"estimated_output_tokens", estimatedOutputTokens,
+	)
 
 	// Check if streaming is requested
 	if req.Stream {
@@ -280,6 +329,26 @@ func (s *GenerationService) GenerateStream(ctx context.Context, req *GenerationR
 	if req.TopP == 0 {
 		req.TopP = 1.0
 	}
+
+	// Pre-flight balance check for streaming
+	estimatedInputTokens := len(req.Prompt) / 4 // Rough estimate
+	estimatedOutputTokens := req.MaxTokens
+	estimatedCost := s.calculateEstimatedCost(estimatedInputTokens, estimatedOutputTokens, modelConfig, requestCtx.PricingTier)
+
+	canProceed, currentBalance, err := s.checkUserBalance(ctx, requestCtx.UserID, estimatedCost)
+	if err != nil {
+		return nil, fmt.Errorf("balance check failed: %w", err)
+	}
+
+	if !canProceed {
+		return nil, fmt.Errorf("user account is inactive")
+	}
+
+	requestCtx.Logger.Info("Pre-flight balance check passed for streaming",
+		"user_id", requestCtx.UserID,
+		"current_balance", currentBalance,
+		"estimated_cost", estimatedCost,
+	)
 
 	// Track optimization metrics
 	var (
@@ -366,6 +435,8 @@ func (s *GenerationService) GenerateStream(ctx context.Context, req *GenerationR
 		optimizationStatus:       optimizationStatus,
 		fallbackReason:           fallbackReason,
 		promptOptimizationResult: promptOptimizationResult,
+		generationService:        s,
+		startTime:                time.Now(),
 	}
 
 	// Return enhanced stream response
@@ -475,6 +546,60 @@ func (s *GenerationService) handleNonStreamingGeneration(ctx context.Context, re
 	// Calculate cost
 	cost := s.calculateCost(llmResp.InputTokens, llmResp.OutputTokens, modelConfig, requestCtx.PricingTier)
 
+	// Calculate total token savings
+	totalInputTokensSaved := 0
+	if promptOptimizationResult != nil {
+		totalInputTokensSaved = promptOptimizationResult.TokensSaved
+	}
+	totalTokensSaved := totalInputTokensSaved
+
+	// Charge the user (allows negative balance)
+	err = s.updateUserBalance(ctx, requestCtx.UserID, -cost)
+	if err != nil {
+		requestCtx.Logger.Error("Failed to charge user for non-streaming request", "error", err, "user_id", requestCtx.UserID, "cost", cost)
+	} else {
+		requestCtx.Logger.Info("User charged for non-streaming request",
+			"user_id", requestCtx.UserID,
+			"cost", cost,
+			"balance_deducted", cost,
+		)
+	}
+
+	// Log request to Firebase
+	requestLog := &firebase.RequestLog{
+		ID:                 fmt.Sprintf("req_%d", time.Now().UnixNano()),
+		UserID:             requestCtx.UserID,
+		APIKeyID:           requestCtx.APIKeyID,
+		RequestID:          requestCtx.RequestID,
+		ModelID:            modelConfig.ModelID,
+		Provider:           modelConfig.Provider,
+		InputTokens:        llmResp.InputTokens,
+		OutputTokens:       llmResp.OutputTokens,
+		TotalTokens:        llmResp.InputTokens + llmResp.OutputTokens,
+		BaseCost:           cost / (1 + (requestCtx.PricingTier.InputMarkupPercent+requestCtx.PricingTier.OutputMarkupPercent)/100),
+		MarkupAmount:       cost - (cost / (1 + (requestCtx.PricingTier.InputMarkupPercent+requestCtx.PricingTier.OutputMarkupPercent)/100)),
+		TotalCost:          cost,
+		TierID:             requestCtx.PricingTier.ID,
+		MarkupPercent:      (requestCtx.PricingTier.InputMarkupPercent + requestCtx.PricingTier.OutputMarkupPercent) / 2,
+		WasOptimized:       wasOptimized,
+		OptimizationStatus: optimizationStatus,
+		TokensSaved:        totalTokensSaved,
+		SavingsAmount:      float64(totalTokensSaved) * modelConfig.InputPricePerMillion / 1000000,
+		Streaming:          false,
+		RequestTimestamp:   time.Now().Add(-time.Duration(100) * time.Millisecond), // Estimate
+		ResponseTimestamp:  time.Now(),
+		DurationMs:         100, // Estimate
+		Status:             "success",
+		IPAddress:          "127.0.0.1", // Will be set from request context
+		UserAgent:          "api-client",
+		Metadata:           map[string]interface{}{"streaming": false},
+	}
+
+	err = s.firebaseService.LogRequest(ctx, requestLog)
+	if err != nil {
+		requestCtx.Logger.Error("Failed to log non-streaming request to Firebase", "error", err)
+	}
+
 	// Build response
 	response := &GenerationResponse{
 		ID:       requestCtx.RequestID,
@@ -509,13 +634,6 @@ func (s *GenerationService) handleNonStreamingGeneration(ctx context.Context, re
 			response.Metadata["optimized_prompt"] = promptOptimizationResult.OptimizedPrompt
 		}
 	}
-
-	// Calculate total token savings
-	totalInputTokensSaved := 0
-	if promptOptimizationResult != nil {
-		totalInputTokensSaved = promptOptimizationResult.TokensSaved
-	}
-	totalTokensSaved := totalInputTokensSaved
 
 	if totalTokensSaved > 0 {
 		response.Metadata["total_tokens_saved"] = totalTokensSaved
@@ -594,9 +712,83 @@ func (s *GenerationService) calculateCost(inputTokens, outputTokens int, modelCo
 	inputCost := (float64(inputTokens) / 1000000) * modelConfig.InputPricePerMillion
 	outputCost := (float64(outputTokens) / 1000000) * modelConfig.OutputPricePerMillion
 
-	// Apply tier-based savings (lower tier = higher savings rate)
-	inputSavings := inputCost * (pricingTier.InputSavingsRateUSDPerMillion / 100)
-	outputSavings := outputCost * (pricingTier.OutputSavingsRateUSDPerMillion / 100)
+	// Apply tier-based markups (percentage-based)
+	inputMarkup := inputCost * (pricingTier.InputMarkupPercent / 100)
+	outputMarkup := outputCost * (pricingTier.OutputMarkupPercent / 100)
 
-	return inputCost + outputCost - inputSavings - outputSavings
+	return inputCost + outputCost + inputMarkup + outputMarkup
+}
+
+// calculateEstimatedCost calculates the estimated cost for the given token usage
+func (s *GenerationService) calculateEstimatedCost(inputTokens, outputTokens int, modelConfig pricing.ModelConfig, pricingTier pricing.PricingTier) float64 {
+	// Convert tokens to millions and apply pricing
+	inputCost := (float64(inputTokens) / 1000000) * modelConfig.InputPricePerMillion
+	outputCost := (float64(outputTokens) / 1000000) * modelConfig.OutputPricePerMillion
+
+	// Apply tier-based markups (percentage-based)
+	inputMarkup := inputCost * (pricingTier.InputMarkupPercent / 100)
+	outputMarkup := outputCost * (pricingTier.OutputMarkupPercent / 100)
+
+	return inputCost + outputCost + inputMarkup + outputMarkup
+}
+
+// checkUserBalance checks the user's balance for the given estimated cost
+func (s *GenerationService) checkUserBalance(ctx context.Context, userID string, estimatedCost float64) (bool, float64, error) {
+	// Get user from cache
+	cacheKey := fmt.Sprintf("user:%s", userID)
+
+	var cachedUser *CachedUserData
+	if cached, found := s.cache.Get(cacheKey); found {
+		if userData, ok := cached.(*CachedUserData); ok {
+			// Check if cache is still valid (5 minutes)
+			if time.Since(userData.LastUpdated) < 5*time.Minute {
+				cachedUser = userData
+			}
+		}
+	}
+
+	// Cache miss or expired, load from Firebase
+	if cachedUser == nil {
+		user, err := s.firebaseService.GetUserByID(ctx, userID)
+		if err != nil {
+			return false, 0, fmt.Errorf("failed to get user from Firebase: %w", err)
+		}
+
+		cachedUser = &CachedUserData{
+			ID:            user.ID,
+			Email:         user.Email,
+			Balance:       user.Balance,
+			TierID:        user.TierID,
+			IsActive:      user.IsActive,
+			CustomPricing: user.CustomPricing,
+			LastUpdated:   time.Now(),
+		}
+
+		// Store in cache for 5 minutes
+		s.cache.Set(cacheKey, cachedUser, 5*time.Minute)
+	}
+
+	// Check if user is active
+	if !cachedUser.IsActive {
+		return false, cachedUser.Balance, fmt.Errorf("user account is inactive")
+	}
+
+	// Allow negative balance (graceful handling)
+	// Users can go into negative balance and it will be deducted from next purchase
+	return true, cachedUser.Balance, nil
+}
+
+// updateUserBalance updates user balance in both cache and Firebase
+func (s *GenerationService) updateUserBalance(ctx context.Context, userID string, amount float64) error {
+	// Update in Firebase first
+	err := s.firebaseService.UpdateUserBalance(ctx, userID, amount)
+	if err != nil {
+		return fmt.Errorf("failed to update user balance in Firebase: %w", err)
+	}
+
+	// Invalidate cache to force refresh on next request
+	cacheKey := fmt.Sprintf("user:%s", userID)
+	s.cache.Delete(cacheKey)
+
+	return nil
 }

@@ -6,18 +6,19 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/apt-router/api/internal/config"
+	"github.com/apt-router/api/internal/firebase"
 	"github.com/apt-router/api/internal/pricing"
 	"github.com/gin-gonic/gin"
 	"github.com/patrickmn/go-cache"
-	supabase "github.com/supabase-community/supabase-go"
 )
 
 // Handler handles all API requests
 type Handler struct {
 	config            *config.Config
-	supabaseClient    *supabase.Client
+	firebaseService   *firebase.Service
 	cache             *cache.Cache
 	pricingService    *pricing.Service
 	generationService *GenerationService
@@ -26,15 +27,15 @@ type Handler struct {
 // NewHandler creates a new API handler
 func NewHandler(
 	cfg *config.Config,
-	supabaseClient *supabase.Client,
+	firebaseService *firebase.Service,
 	cache *cache.Cache,
 	pricingService *pricing.Service,
 ) *Handler {
-	generationService := NewGenerationService(cfg, supabaseClient, cache, pricingService)
+	generationService := NewGenerationService(cfg, firebaseService, cache, pricingService)
 
 	return &Handler{
 		config:            cfg,
-		supabaseClient:    supabaseClient,
+		firebaseService:   firebaseService,
 		cache:             cache,
 		pricingService:    pricingService,
 		generationService: generationService,
@@ -50,7 +51,7 @@ func (h *Handler) HealthCheck(c *gin.Context) {
 	})
 }
 
-// AuthMiddleware authenticates API key requests
+// AuthMiddleware authenticates API key requests and sets up request context
 func (h *Handler) AuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		requestID := h.getRequestID(c)
@@ -71,7 +72,7 @@ func (h *Handler) AuthMiddleware() gin.HandlerFunc {
 		}
 
 		// For development/testing, accept any API key and create a mock context
-		// In production, this would validate the API key against the database
+		// In production, this would validate the API key against Firebase
 		if apiKey == "" {
 			logger.Warn("No API key provided, using mock key for development")
 			apiKey = "mock-api-key-for-development"
@@ -81,23 +82,76 @@ func (h *Handler) AuthMiddleware() gin.HandlerFunc {
 		keyHash := h.hashAPIKey(apiKey)
 		logger.Info("API key authentication", "key_hash", keyHash[:8]+"...")
 
-		// Create request context
+		// Get user from Firebase (for development, use mock user)
+		var user *firebase.User
+		var err error
+
+		if apiKey == "mock-api-key-for-development" {
+			// Create mock user for development
+			user = &firebase.User{
+				ID:            "mock-user-id",
+				Email:         "dev@example.com",
+				Balance:       100.0,
+				TierID:        "tier-1",
+				IsActive:      true,
+				CustomPricing: false,
+			}
+		} else {
+			// Get real user from Firebase
+			user, err = h.firebaseService.GetUserByAPIKey(c.Request.Context(), keyHash)
+			if err != nil {
+				logger.Error("Failed to get user by API key", "error", err)
+				c.JSON(http.StatusUnauthorized, gin.H{
+					"error": "Invalid API key",
+				})
+				c.Abort()
+				return
+			}
+		}
+
+		// Get cached user data for performance
+		cachedUser, err := h.getUserFromCache(c.Request.Context(), user.ID)
+		if err != nil {
+			logger.Error("Failed to get cached user data", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Failed to load user data",
+			})
+			c.Abort()
+			return
+		}
+
+		// Get pricing tier from cache
+		tier, err := h.getPricingTierFromCache(c.Request.Context(), cachedUser.TierID)
+		if err != nil {
+			logger.Error("Failed to get pricing tier", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "Failed to load pricing information",
+			})
+			c.Abort()
+			return
+		}
+
+		// Create request context with cached user data
 		requestCtx := &RequestContext{
 			RequestID: requestID,
-			UserID:    "mock-user-id",
-			APIKeyID:  "mock-api-key-id",
+			UserID:    user.ID,
+			APIKeyID:  keyHash,
 			PricingTier: pricing.PricingTier{
-				ID:                             1,
-				TierName:                       "free",
-				MinMonthlyRequests:             0,
-				InputSavingsRateUSDPerMillion:  0.50,
-				OutputSavingsRateUSDPerMillion: 1.50,
+				ID:                  tier.ID,
+				TierName:            tier.TierName,
+				MinMonthlySpend:     tier.MinMonthlySpend,
+				InputMarkupPercent:  tier.InputMarkupPercent,
+				OutputMarkupPercent: tier.OutputMarkupPercent,
+				IsActive:            tier.IsActive,
+				IsCustom:            tier.IsCustom,
+				CustomModelPricing:  tier.CustomModelPricing,
 			},
-			Logger: logger,
+			Logger:     logger,
+			CachedUser: cachedUser,
 		}
 
 		// Store request context in Gin context
-		c.Set(string(requestContextKey), requestCtx)
+		c.Set(string(requestContextGinKey), requestCtx)
 
 		// Continue to next middleware/handler
 		c.Next()
@@ -106,7 +160,7 @@ func (h *Handler) AuthMiddleware() gin.HandlerFunc {
 
 // JWTAuthMiddleware authenticates JWT requests
 func (h *Handler) JWTAuthMiddleware() gin.HandlerFunc {
-	// TODO: Implement JWT authentication
+	// TODO: Implement JWT authentication with Firebase Auth
 	return func(c *gin.Context) {
 		c.Next()
 	}
@@ -150,29 +204,15 @@ type UsageInfo struct {
 
 // Generate handles the main generation endpoint
 func (h *Handler) Generate(c *gin.Context) {
+	startTime := time.Now()
+
 	// Get request context
 	requestCtx, exists := h.getRequestContext(c)
 	if !exists {
-		// For testing, create a mock request context if one doesn't exist
-		requestID := h.getRequestID(c)
-		logger := h.getLogger(c)
-
-		requestCtx = &RequestContext{
-			RequestID: requestID,
-			UserID:    "mock-user-id",
-			APIKeyID:  "mock-api-key-id",
-			PricingTier: pricing.PricingTier{
-				ID:                             1,
-				TierName:                       "free",
-				MinMonthlyRequests:             0,
-				InputSavingsRateUSDPerMillion:  0.50,
-				OutputSavingsRateUSDPerMillion: 1.50,
-			},
-			Logger: logger,
-		}
-
-		// Store it for future use
-		c.Set(string(requestContextKey), requestCtx)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Request context not found",
+		})
+		return
 	}
 
 	// Parse request
@@ -209,6 +249,39 @@ func (h *Handler) Generate(c *gin.Context) {
 		return
 	}
 
+	// Calculate cost with percentage-based pricing
+	totalCost, markupAmount, err := h.pricingService.CalculateCost(
+		c.Request.Context(),
+		requestCtx.UserID,
+		req.Model,
+		result.Response.Usage.InputTokens,
+		result.Response.Usage.OutputTokens,
+	)
+	if err != nil {
+		requestCtx.Logger.Error("Failed to calculate cost", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to calculate cost",
+		})
+		return
+	}
+
+	// Check user balance
+	balance, err := h.firebaseService.GetUserBalance(c.Request.Context(), requestCtx.UserID)
+	if err != nil {
+		requestCtx.Logger.Error("Failed to get user balance", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to check balance",
+		})
+		return
+	}
+
+	if balance < totalCost {
+		c.JSON(http.StatusPaymentRequired, gin.H{
+			"error": fmt.Sprintf("Insufficient balance: %.6f required, %.6f available", totalCost, balance),
+		})
+		return
+	}
+
 	// Convert service response to HTTP response
 	httpResp := &GenerateResponse{
 		ID:           result.Response.ID,
@@ -225,19 +298,27 @@ func (h *Handler) Generate(c *gin.Context) {
 		httpResp.Usage = &UsageInfo{
 			InputTokens:  result.Response.Usage.InputTokens,
 			OutputTokens: result.Response.Usage.OutputTokens,
-			TotalTokens:  result.Response.Usage.TotalTokens,
+			TotalTokens:  result.Response.Usage.InputTokens + result.Response.Usage.OutputTokens,
 		}
 	}
 
-	// Log the request
-	err = h.logRequest(c.Request.Context(), requestCtx, serviceReq, result)
+	// Add cost information to metadata
+	if httpResp.Metadata == nil {
+		httpResp.Metadata = make(map[string]interface{})
+	}
+	httpResp.Metadata["total_cost"] = totalCost
+	httpResp.Metadata["markup_amount"] = markupAmount
+	httpResp.Metadata["base_cost"] = totalCost - markupAmount
+
+	// Log the request for audit purposes
+	err = h.logRequest(c.Request.Context(), requestCtx, serviceReq, result, totalCost, markupAmount, startTime, time.Now(), false)
 	if err != nil {
 		requestCtx.Logger.Error("Failed to log request", "error", err)
 		// Don't fail the request, just log the error
 	}
 
 	// Charge the user
-	err = h.chargeUser(c.Request.Context(), requestCtx, result.Response.Metadata["cost"].(float64))
+	err = h.firebaseService.UpdateUserBalance(c.Request.Context(), requestCtx.UserID, -totalCost)
 	if err != nil {
 		requestCtx.Logger.Error("Failed to charge user", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -273,59 +354,59 @@ func (h *Handler) getBoolValue(ptr *bool, defaultValue bool) bool {
 	return defaultValue
 }
 
-// logRequest logs the generation request to the database
-func (h *Handler) logRequest(_ context.Context, requestCtx *RequestContext, req *GenerationRequest, result *GenerationResult) error {
-	// TODO: Implement database logging using Supabase
-	// For now, just log to console
-	requestCtx.Logger.Info("Request logged",
-		"user_id", requestCtx.UserID,
-		"model", req.Model,
-		"input_tokens", result.Response.Usage.InputTokens,
-		"output_tokens", result.Response.Usage.OutputTokens,
-		"cost", result.Response.Metadata["cost"],
-		"was_optimized", result.WasOptimized,
-		"optimization_status", result.OptimizationStatus,
-		"fallback_reason", result.FallbackReason,
-	)
-	return nil
-}
+// logRequest logs the generation request to Firebase for audit purposes
+func (h *Handler) logRequest(ctx context.Context, requestCtx *RequestContext, req *GenerationRequest, result *GenerationResult, totalCost, markupAmount float64, startTime, endTime time.Time, streaming bool) error {
+	// Create request log
+	log := &firebase.RequestLog{
+		ID:                 requestCtx.RequestID,
+		UserID:             requestCtx.UserID,
+		APIKeyID:           requestCtx.APIKeyID,
+		RequestID:          requestCtx.RequestID,
+		ModelID:            req.Model,
+		Provider:           result.Response.Provider,
+		InputTokens:        result.Response.Usage.InputTokens,
+		OutputTokens:       result.Response.Usage.OutputTokens,
+		TotalTokens:        result.Response.Usage.InputTokens + result.Response.Usage.OutputTokens,
+		BaseCost:           totalCost - markupAmount,
+		MarkupAmount:       markupAmount,
+		TotalCost:          totalCost,
+		TierID:             requestCtx.PricingTier.ID,
+		MarkupPercent:      requestCtx.PricingTier.InputMarkupPercent, // Use input markup as representative
+		WasOptimized:       result.WasOptimized,
+		OptimizationStatus: result.OptimizationStatus,
+		TokensSaved:        0, // Will be calculated if optimization occurred
+		SavingsAmount:      0, // Will be calculated if optimization occurred
+		Streaming:          streaming,
+		RequestTimestamp:   startTime,
+		ResponseTimestamp:  endTime,
+		DurationMs:         endTime.Sub(startTime).Milliseconds(),
+		Status:             "success",
+		IPAddress:          "", // TODO: Extract from request
+		UserAgent:          "", // TODO: Extract from request
+		Metadata:           result.Response.Metadata,
+	}
 
-// chargeUser charges the user for the request
-func (h *Handler) chargeUser(_ context.Context, requestCtx *RequestContext, cost float64) error {
-	// TODO: Implement database charging using Supabase
-	// For now, just log to console
-	requestCtx.Logger.Info("User charged",
-		"user_id", requestCtx.UserID,
-		"cost", cost,
-	)
-	return nil
+	// Calculate tokens saved if optimization occurred
+	if result.PromptOptimizationResult != nil {
+		log.TokensSaved = result.PromptOptimizationResult.TokensSaved
+		log.SavingsAmount = float64(result.PromptOptimizationResult.TokensSaved) * (requestCtx.PricingTier.InputMarkupPercent / 100) / 1000000
+	}
+
+	// Log to Firebase
+	return h.firebaseService.LogRequest(ctx, log)
 }
 
 // GenerateStream handles the streaming generation endpoint
 func (h *Handler) GenerateStream(c *gin.Context) {
+	startTime := time.Now()
+
 	// Get request context
 	requestCtx, exists := h.getRequestContext(c)
 	if !exists {
-		// For testing, create a mock request context if one doesn't exist
-		requestID := h.getRequestID(c)
-		logger := h.getLogger(c)
-
-		requestCtx = &RequestContext{
-			RequestID: requestID,
-			UserID:    "mock-user-id",
-			APIKeyID:  "mock-api-key-id",
-			PricingTier: pricing.PricingTier{
-				ID:                             1,
-				TierName:                       "free",
-				MinMonthlyRequests:             0,
-				InputSavingsRateUSDPerMillion:  0.50,
-				OutputSavingsRateUSDPerMillion: 1.50,
-			},
-			Logger: logger,
-		}
-
-		// Store it for future use
-		c.Set(string(requestContextKey), requestCtx)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Request context not found",
+		})
+		return
 	}
 
 	// Parse request
@@ -372,16 +453,6 @@ func (h *Handler) GenerateStream(c *gin.Context) {
 		}
 		if optimizationStatus, ok := streamResp.Metadata["optimization_status"]; ok {
 			c.Header("X-Optimization-Status", optimizationStatus)
-		}
-	}
-	// Set optimization headers from EnhancedStreamReader if possible
-	if enhanced, ok := streamResp.Stream.(*EnhancedStreamReader); ok {
-		if enhanced.promptOptimizationResult != nil {
-			c.Header("X-Input-Tokens-Original", fmt.Sprintf("%d", enhanced.promptOptimizationResult.OriginalTokens))
-			c.Header("X-Input-Tokens-Saved", fmt.Sprintf("%d", enhanced.promptOptimizationResult.TokensSaved))
-		} else {
-			c.Header("X-Input-Tokens-Original", fmt.Sprintf("%d", enhanced.inputTokens))
-			c.Header("X-Input-Tokens-Saved", "0")
 		}
 	}
 
@@ -469,8 +540,8 @@ func (h *Handler) GenerateStream(c *gin.Context) {
 			c.Header("X-Input-Tokens-Saved", "0")
 		}
 
-		// Calculate total cost
-		totalCost := enhanced.calculateCost(enhanced.inputTokens, enhanced.outputTokens)
+		// Calculate total cost using the generation service
+		totalCost := h.generationService.calculateCost(enhanced.inputTokens, enhanced.outputTokens, enhanced.modelConfig, requestCtx.PricingTier)
 
 		// Create metadata for logging and headers (not sent to user)
 		metadata := map[string]interface{}{
@@ -510,19 +581,20 @@ func (h *Handler) GenerateStream(c *gin.Context) {
 		if savedTokensEstimate > 0 {
 			c.Header("X-Output-Tokens-Saved-Estimate", fmt.Sprintf("%d", savedTokensEstimate))
 		}
-	}
 
-	// Log the streaming request completion
-	requestCtx.Logger.Info("Streaming request completed",
-		"user_id", requestCtx.UserID,
-		"model", req.Model,
-		"streaming", true,
-	)
+		// Log the streaming request completion
+		requestCtx.Logger.Info("Streaming request completed",
+			"user_id", requestCtx.UserID,
+			"model", req.Model,
+			"streaming", true,
+			"duration_ms", time.Since(startTime).Milliseconds(),
+		)
+	}
 }
 
 // GetProfile handles getting user profile
 func (h *Handler) GetProfile(c *gin.Context) {
-	// TODO: Implement get profile logic
+	// TODO: Implement get profile logic with Firebase
 	c.JSON(http.StatusOK, gin.H{
 		"message": "GetProfile endpoint - not implemented yet",
 	})
@@ -530,7 +602,7 @@ func (h *Handler) GetProfile(c *gin.Context) {
 
 // GetBalance handles getting user balance
 func (h *Handler) GetBalance(c *gin.Context) {
-	// TODO: Implement get balance logic
+	// TODO: Implement get balance logic with Firebase
 	c.JSON(http.StatusOK, gin.H{
 		"message": "GetBalance endpoint - not implemented yet",
 	})
@@ -538,7 +610,7 @@ func (h *Handler) GetBalance(c *gin.Context) {
 
 // GetUsage handles getting user usage
 func (h *Handler) GetUsage(c *gin.Context) {
-	// TODO: Implement get usage logic
+	// TODO: Implement get usage logic with Firebase
 	c.JSON(http.StatusOK, gin.H{
 		"message": "GetUsage endpoint - not implemented yet",
 	})
@@ -546,7 +618,7 @@ func (h *Handler) GetUsage(c *gin.Context) {
 
 // CreateAPIKey handles creating new API keys
 func (h *Handler) CreateAPIKey(c *gin.Context) {
-	// TODO: Implement create API key logic
+	// TODO: Implement create API key logic with Firebase
 	c.JSON(http.StatusOK, gin.H{
 		"message": "CreateAPIKey endpoint - not implemented yet",
 	})
@@ -554,7 +626,7 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 
 // ListAPIKeys handles listing user's API keys
 func (h *Handler) ListAPIKeys(c *gin.Context) {
-	// TODO: Implement list API keys logic
+	// TODO: Implement list API keys logic with Firebase
 	c.JSON(http.StatusOK, gin.H{
 		"message": "ListAPIKeys endpoint - not implemented yet",
 	})
@@ -562,7 +634,7 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 
 // RevokeAPIKey handles revoking API keys
 func (h *Handler) RevokeAPIKey(c *gin.Context) {
-	// TODO: Implement revoke API key logic
+	// TODO: Implement revoke API key logic with Firebase
 	c.JSON(http.StatusOK, gin.H{
 		"message": "RevokeAPIKey endpoint - not implemented yet",
 	})
