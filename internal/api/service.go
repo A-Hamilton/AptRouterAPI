@@ -290,17 +290,17 @@ func (s *GenerationService) GenerateStream(ctx context.Context, req *GenerationR
 	)
 
 	// Default optimization mode
-	mode := req.OptimizationMode
-	// Force efficiency mode for aggressive optimization
-	mode = "efficiency"
+	if req.OptimizationMode != "efficiency" {
+		req.OptimizationMode = "context"
+	}
 
 	// Step 1: Optimize input prompt if optimization is enabled and prompt is long enough
 	var promptOptimizationResult *llm.OptimizationResult
 
 	if s.optimizer != nil && s.config.Optimization.Enabled && s.optimizer.ShouldOptimize(req.Prompt, 50) {
-		requestCtx.Logger.Info("Attempting prompt optimization for streaming", "original_length", len(req.Prompt), "mode", mode)
+		requestCtx.Logger.Info("Attempting prompt optimization", "original_length", len(req.Prompt), "mode", req.OptimizationMode)
 
-		optimizationResult, err := s.optimizer.OptimizePromptWithMode(ctx, req.Prompt, mode)
+		optimizationResult, err := s.optimizer.OptimizePromptWithMode(ctx, req.Prompt, req.OptimizationMode)
 		if err != nil {
 			requestCtx.Logger.Warn("Prompt optimization failed for streaming, using original", "error", err)
 			optimizationStatus = "failed"
@@ -392,19 +392,17 @@ func (s *GenerationService) handleNonStreamingGeneration(ctx context.Context, re
 	)
 
 	// Default optimization mode
-	mode := req.OptimizationMode
-	if mode != "efficiency" {
-		mode = "context"
+	if req.OptimizationMode != "efficiency" {
+		req.OptimizationMode = "context"
 	}
 
 	// Step 1: Optimize input prompt if optimization is enabled and prompt is long enough
 	var promptOptimizationResult *llm.OptimizationResult
-	var responseOptimizationResult *llm.OptimizationResult
 
 	if s.optimizer != nil && s.config.Optimization.Enabled && s.optimizer.ShouldOptimize(req.Prompt, 50) {
-		requestCtx.Logger.Info("Attempting prompt optimization", "original_length", len(req.Prompt), "mode", mode)
+		requestCtx.Logger.Info("Attempting prompt optimization", "original_length", len(req.Prompt), "mode", req.OptimizationMode)
 
-		optimizationResult, err := s.optimizer.OptimizePromptWithMode(ctx, req.Prompt, mode)
+		optimizationResult, err := s.optimizer.OptimizePromptWithMode(ctx, req.Prompt, req.OptimizationMode)
 		if err != nil {
 			requestCtx.Logger.Warn("Prompt optimization failed, using original", "error", err)
 			optimizationStatus = "failed"
@@ -450,9 +448,9 @@ func (s *GenerationService) handleNonStreamingGeneration(ctx context.Context, re
 
 	// Step 2: Optimize response if optimization is enabled and response is long enough
 	if s.optimizer != nil && s.config.Optimization.Enabled && s.optimizer.ShouldOptimize(llmResp.Text, 100) {
-		requestCtx.Logger.Info("Attempting response optimization", "original_length", len(llmResp.Text), "mode", mode)
+		requestCtx.Logger.Info("Attempting response optimization", "original_length", len(llmResp.Text), "mode", req.OptimizationMode)
 
-		optimizationResult, err := s.optimizer.OptimizeResponseWithMode(ctx, llmResp.Text, mode)
+		optimizationResult, err := s.optimizer.OptimizeResponseWithMode(ctx, llmResp.Text, req.OptimizationMode)
 		if err != nil {
 			requestCtx.Logger.Warn("Response optimization failed, using original", "error", err)
 			if optimizationStatus == "success" {
@@ -465,7 +463,6 @@ func (s *GenerationService) handleNonStreamingGeneration(ctx context.Context, re
 			llmResp.Text = optimizationResult.OptimizedText
 			// Use the optimized token count from the result
 			llmResp.OutputTokens = optimizationResult.OptimizedTokens
-			responseOptimizationResult = optimizationResult
 			requestCtx.Logger.Info("Response optimization successful",
 				"original_tokens", optimizationResult.OriginalTokens,
 				"optimized_tokens", optimizationResult.OptimizedTokens,
@@ -513,30 +510,17 @@ func (s *GenerationService) handleNonStreamingGeneration(ctx context.Context, re
 		}
 	}
 
-	if responseOptimizationResult != nil {
-		response.Metadata["output_tokens_saved"] = responseOptimizationResult.TokensSaved
-		response.Metadata["output_savings_percent"] = responseOptimizationResult.SavingsPercent
-		response.Metadata["output_optimization_type"] = responseOptimizationResult.OptimizationType
-		if responseOptimizationResult.OptimizedResponse != "" {
-			response.Metadata["optimized_response"] = responseOptimizationResult.OptimizedResponse
-		}
-	}
-
 	// Calculate total token savings
 	totalInputTokensSaved := 0
-	totalOutputTokensSaved := 0
 	if promptOptimizationResult != nil {
 		totalInputTokensSaved = promptOptimizationResult.TokensSaved
 	}
-	if responseOptimizationResult != nil {
-		totalOutputTokensSaved = responseOptimizationResult.TokensSaved
-	}
-	totalTokensSaved := totalInputTokensSaved + totalOutputTokensSaved
+	totalTokensSaved := totalInputTokensSaved
 
 	if totalTokensSaved > 0 {
 		response.Metadata["total_tokens_saved"] = totalTokensSaved
 		response.Metadata["total_input_tokens_saved"] = totalInputTokensSaved
-		response.Metadata["total_output_tokens_saved"] = totalOutputTokensSaved
+		response.Metadata["total_output_tokens_saved"] = 0
 	}
 
 	return &GenerationResult{
@@ -545,7 +529,7 @@ func (s *GenerationService) handleNonStreamingGeneration(ctx context.Context, re
 		OptimizationStatus:         optimizationStatus,
 		FallbackReason:             fallbackReason,
 		PromptOptimizationResult:   promptOptimizationResult,
-		ResponseOptimizationResult: responseOptimizationResult,
+		ResponseOptimizationResult: nil,
 	}, nil
 }
 

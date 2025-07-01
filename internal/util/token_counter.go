@@ -123,9 +123,5 @@ func (tc *TokenCounter) PreloadEncodings() error {
 func (tc *TokenCounter) ClearCache() {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
-
-	// Clear the map
-	for k := range tc.encodings {
-		delete(tc.encodings, k)
-	}
+	tc.encodings = make(map[string]*tiktoken.Tiktoken)
 }

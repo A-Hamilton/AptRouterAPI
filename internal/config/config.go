@@ -81,10 +81,8 @@ type OptimizationConfig struct {
 
 // LoadConfig loads configuration from environment variables and .env file
 func LoadConfig() (*Config, error) {
-	// First, try to load .env file using godotenv
-	if err := gotenv.Load(); err != nil {
-		// .env file not found, continue with environment variables only
-	}
+	// Load .env file if present (ignore errors if file doesn't exist)
+	_ = gotenv.Load()
 
 	// Set default values first
 	setDefaults()
@@ -181,29 +179,24 @@ func setDefaults() {
 
 // validateConfig validates that all required configuration fields are present
 func validateConfig(config *Config) error {
-	if config.Supabase.URL == "" {
-		return fmt.Errorf("SUPABASE_URL is required")
+	requiredFields := []struct {
+		name  string
+		value string
+	}{
+		{"SUPABASE_URL", config.Supabase.URL},
+		{"SUPABASE_SERVICE_ROLE_KEY", config.Supabase.ServiceRoleKey},
+		{"SUPABASE_ANON_KEY", config.Supabase.AnonKey},
+		{"JWT_SECRET", config.Security.JWTSecret},
+		{"API_KEY_SALT", config.Security.APIKeySalt},
+		{"GOOGLE_API_KEY", config.LLM.GoogleAPIKey},
+		{"OPENAI_API_KEY", config.LLM.OpenAIAPIKey},
+		{"ANTHROPIC_API_KEY", config.LLM.AnthropicAPIKey},
 	}
-	if config.Supabase.ServiceRoleKey == "" {
-		return fmt.Errorf("SUPABASE_SERVICE_ROLE_KEY is required")
-	}
-	if config.Supabase.AnonKey == "" {
-		return fmt.Errorf("SUPABASE_ANON_KEY is required")
-	}
-	if config.Security.JWTSecret == "" {
-		return fmt.Errorf("JWT_SECRET is required")
-	}
-	if config.Security.APIKeySalt == "" {
-		return fmt.Errorf("API_KEY_SALT is required")
-	}
-	if config.LLM.GoogleAPIKey == "" {
-		return fmt.Errorf("GOOGLE_API_KEY is required")
-	}
-	if config.LLM.OpenAIAPIKey == "" {
-		return fmt.Errorf("OPENAI_API_KEY is required")
-	}
-	if config.LLM.AnthropicAPIKey == "" {
-		return fmt.Errorf("ANTHROPIC_API_KEY is required")
+
+	for _, field := range requiredFields {
+		if field.value == "" {
+			return fmt.Errorf("%s is required", field.name)
+		}
 	}
 
 	return nil

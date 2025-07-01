@@ -97,7 +97,7 @@ func (h *Handler) AuthMiddleware() gin.HandlerFunc {
 		}
 
 		// Store request context in Gin context
-		c.Set("request_context", requestCtx)
+		c.Set(string(requestContextKey), requestCtx)
 
 		// Continue to next middleware/handler
 		c.Next()
@@ -172,7 +172,7 @@ func (h *Handler) Generate(c *gin.Context) {
 		}
 
 		// Store it for future use
-		c.Set("request_context", requestCtx)
+		c.Set(string(requestContextKey), requestCtx)
 	}
 
 	// Parse request
@@ -274,7 +274,7 @@ func (h *Handler) getBoolValue(ptr *bool, defaultValue bool) bool {
 }
 
 // logRequest logs the generation request to the database
-func (h *Handler) logRequest(ctx context.Context, requestCtx *RequestContext, req *GenerationRequest, result *GenerationResult) error {
+func (h *Handler) logRequest(_ context.Context, requestCtx *RequestContext, req *GenerationRequest, result *GenerationResult) error {
 	// TODO: Implement database logging using Supabase
 	// For now, just log to console
 	requestCtx.Logger.Info("Request logged",
@@ -291,7 +291,7 @@ func (h *Handler) logRequest(ctx context.Context, requestCtx *RequestContext, re
 }
 
 // chargeUser charges the user for the request
-func (h *Handler) chargeUser(ctx context.Context, requestCtx *RequestContext, cost float64) error {
+func (h *Handler) chargeUser(_ context.Context, requestCtx *RequestContext, cost float64) error {
 	// TODO: Implement database charging using Supabase
 	// For now, just log to console
 	requestCtx.Logger.Info("User charged",
@@ -325,7 +325,7 @@ func (h *Handler) GenerateStream(c *gin.Context) {
 		}
 
 		// Store it for future use
-		c.Set("request_context", requestCtx)
+		c.Set(string(requestContextKey), requestCtx)
 	}
 
 	// Parse request

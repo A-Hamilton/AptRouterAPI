@@ -461,26 +461,28 @@ func (s *Service) CalculateSavingsFee(tier PricingTier, inputTokensSaved, output
 
 // RefreshCache refreshes the cached data
 func (s *Service) RefreshCache(ctx context.Context) error {
-	slog.Info("Refreshing pricing cache...")
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// Load pricing tiers
 	if err := s.loadPricingTiers(ctx); err != nil {
-		return fmt.Errorf("failed to load pricing tiers: %w", err)
+		return fmt.Errorf("failed to refresh pricing tiers: %w", err)
 	}
 
 	// Load model configs
 	if err := s.loadModelConfigs(ctx); err != nil {
-		return fmt.Errorf("failed to load model configs: %w", err)
+		return fmt.Errorf("failed to refresh model configs: %w", err)
 	}
 
 	s.lastRefresh = time.Now()
-	slog.Info("Pricing cache refreshed successfully",
+	slog.Info("Cache refreshed successfully",
 		"pricing_tiers", len(s.pricingTiers),
 		"model_configs", len(s.modelConfigs))
+
 	return nil
 }
 
-// shouldRefreshCache checks if the cache should be refreshed based on TTL
+// shouldRefreshCache checks if the cache should be refreshed
 func (s *Service) shouldRefreshCache() bool {
 	return time.Since(s.lastRefresh) > s.cacheTTL
 }
@@ -495,6 +497,6 @@ func (s *Service) GetCacheStats() map[string]interface{} {
 		"model_configs_count": len(s.modelConfigs),
 		"last_refresh":        s.lastRefresh,
 		"cache_ttl":           s.cacheTTL,
-		"should_refresh":      s.shouldRefreshCache(),
+		"time_since_refresh":  time.Since(s.lastRefresh),
 	}
 }

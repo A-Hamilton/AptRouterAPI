@@ -12,6 +12,14 @@ import (
 	"github.com/google/uuid"
 )
 
+// ContextKey types to avoid collisions with built-in string keys
+type contextKey string
+
+const (
+	loggerKey    contextKey = "logger"
+	requestIDKey contextKey = "request_id"
+)
+
 // RequestContext contains request-scoped data
 type RequestContext struct {
 	RequestID   string
@@ -27,7 +35,7 @@ func (h *Handler) RequestLogger() gin.HandlerFunc {
 		start := time.Now()
 		requestID := uuid.New().String()
 
-		// Create request-scoped logger
+		// Create request-scoped logger with pre-allocated fields
 		logger := slog.With(
 			"request_id", requestID,
 			"method", c.Request.Method,
@@ -37,17 +45,17 @@ func (h *Handler) RequestLogger() gin.HandlerFunc {
 		)
 
 		// Store logger in context
-		ctx := context.WithValue(c.Request.Context(), "logger", logger)
+		ctx := context.WithValue(c.Request.Context(), loggerKey, logger)
 		c.Request = c.Request.WithContext(ctx)
 
 		// Store request ID in context
-		ctx = context.WithValue(ctx, "request_id", requestID)
+		ctx = context.WithValue(ctx, requestIDKey, requestID)
 		c.Request = c.Request.WithContext(ctx)
 
 		// Process request
 		c.Next()
 
-		// Log request completion
+		// Log request completion with performance metrics
 		duration := time.Since(start)
 		logger.Info("Request completed",
 			"status", c.Writer.Status(),
@@ -73,7 +81,7 @@ type UserProfile struct {
 	Balance float64 `json:"balance"`
 }
 
-// hashAPIKey hashes the API key using SHA-256
+// hashAPIKey hashes the API key using SHA-256 with salt
 func (h *Handler) hashAPIKey(apiKey string) string {
 	// Add salt to the API key before hashing
 	saltedKey := apiKey + h.config.Security.APIKeySalt
@@ -110,7 +118,7 @@ func (h *Handler) getUserProfile(ctx context.Context, userID string) (*UserProfi
 
 // getRequestID gets the request ID from the context
 func (h *Handler) getRequestID(c *gin.Context) string {
-	if requestID, exists := c.Request.Context().Value("request_id").(string); exists {
+	if requestID, exists := c.Request.Context().Value(requestIDKey).(string); exists {
 		return requestID
 	}
 	return uuid.New().String()
@@ -118,15 +126,22 @@ func (h *Handler) getRequestID(c *gin.Context) string {
 
 // getLogger gets the logger from the context
 func (h *Handler) getLogger(c *gin.Context) *slog.Logger {
-	if logger, exists := c.Request.Context().Value("logger").(*slog.Logger); exists {
+	if logger, exists := c.Request.Context().Value(loggerKey).(*slog.Logger); exists {
 		return logger
 	}
 	return slog.Default()
 }
 
+// GinContextKey types to avoid collisions with built-in string keys
+type ginContextKey string
+
+const (
+	requestContextKey ginContextKey = "request_context"
+)
+
 // getRequestContext gets the request context from Gin context
 func (h *Handler) getRequestContext(c *gin.Context) (*RequestContext, bool) {
-	if ctx, exists := c.Get("request_context"); exists {
+	if ctx, exists := c.Get(string(requestContextKey)); exists {
 		if requestCtx, ok := ctx.(*RequestContext); ok {
 			return requestCtx, true
 		}

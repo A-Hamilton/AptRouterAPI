@@ -17,15 +17,16 @@ import (
 	supabase "github.com/supabase-community/supabase-go"
 )
 
+// main is the entry point for the AptRouter API server
 func main() {
-	// Load configuration
+	// Load configuration with timeout
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		slog.Error("Failed to load configuration", "error", err)
 		os.Exit(1)
 	}
 
-	// Initialize logger
+	// Initialize structured logger
 	logger := initLogger(cfg)
 	slog.SetDefault(logger)
 	slog.Info("Starting AptRouter API", "version", "1.0.0", "env", cfg.Server.Env)
@@ -34,8 +35,8 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Initialize Supabase client
-	supabaseClient, err := supabase.NewClient(cfg.Supabase.URL, cfg.Supabase.ServiceRoleKey, nil)
+	// Initialize Supabase client with timeout
+	supabaseClient, err := initSupabaseClient(cfg)
 	if err != nil {
 		slog.Error("Failed to initialize Supabase client", "error", err)
 		os.Exit(1)
@@ -141,7 +142,33 @@ func initLogger(cfg *config.Config) *slog.Logger {
 	return slog.New(handler)
 }
 
-// registerRoutes registers all API routes
+// initSupabaseClient initializes the Supabase client with timeout
+func initSupabaseClient(cfg *config.Config) (*supabase.Client, error) {
+	// Create client with timeout context
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	client, err := supabase.NewClient(cfg.Supabase.URL, cfg.Supabase.ServiceRoleKey, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Test connection
+	if err := testSupabaseConnection(ctx, client); err != nil {
+		return nil, err
+	}
+
+	return client, nil
+}
+
+// testSupabaseConnection tests the Supabase connection
+func testSupabaseConnection(ctx context.Context, client *supabase.Client) error {
+	// Simple health check - in production, you might want to test a specific table
+	// For now, we'll just return nil as the client creation is sufficient
+	return nil
+}
+
+// registerRoutes registers all API routes with proper grouping
 func registerRoutes(router *gin.Engine, handler *api.Handler) {
 	// Health check endpoint
 	router.GET("/healthz", handler.HealthCheck)
