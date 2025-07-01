@@ -28,6 +28,8 @@ go.work.sum
 .env
 .env.*
 
+*.ps1
+
 # Editor/IDE
 # .idea/
 # .vscode/
