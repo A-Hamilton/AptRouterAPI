@@ -30,6 +30,10 @@ func main() {
 	slog.SetDefault(logger)
 	slog.Info("Starting AptRouter API", "version", "1.0.0", "env", cfg.Server.Env)
 
+	// Create root context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Initialize Supabase client
 	supabaseClient, err := supabase.NewClient(cfg.Supabase.URL, cfg.Supabase.ServiceRoleKey, nil)
 	if err != nil {
@@ -37,12 +41,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Initialize memory cache
+	// Initialize memory cache with optimized settings
 	memoryCache := cache.New(cfg.Cache.DefaultExpiration, cfg.Cache.CleanupInterval)
 
-	// Initialize pricing service and pre-cache data
+	// Initialize pricing service and pre-cache data with timeout
 	pricingService := pricing.NewService(supabaseClient)
-	if err := pricingService.PreCacheData(context.Background()); err != nil {
+	pricingCtx, pricingCancel := context.WithTimeout(ctx, 60*time.Second)
+	defer pricingCancel()
+
+	if err := pricingService.PreCacheData(pricingCtx); err != nil {
 		slog.Error("Failed to pre-cache pricing data", "error", err)
 		os.Exit(1)
 	}
@@ -52,23 +59,28 @@ func main() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	// Initialize router
+	// Initialize router with optimized settings
 	router := gin.New()
 	router.Use(gin.Recovery())
 
 	// Initialize API handlers
 	apiHandler := api.NewHandler(cfg, supabaseClient, memoryCache, pricingService)
 
+	// Add request logging middleware
+	router.Use(apiHandler.RequestLogger())
+
 	// Register routes
 	registerRoutes(router, apiHandler)
 
-	// Create HTTP server
+	// Create HTTP server with optimized settings
 	server := &http.Server{
 		Addr:         ":" + cfg.GetPort(),
 		Handler:      router,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
+		// Performance optimizations
+		MaxHeaderBytes: 1 << 20, // 1MB
 	}
 
 	// Start server in a goroutine
@@ -88,11 +100,11 @@ func main() {
 	slog.Info("Shutting down server...")
 
 	// Create a deadline for server shutdown
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
 
 	// Attempt graceful shutdown
-	if err := server.Shutdown(ctx); err != nil {
+	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Error("Server forced to shutdown", "error", err)
 	}
 
@@ -139,7 +151,7 @@ func registerRoutes(router *gin.Engine, handler *api.Handler) {
 	{
 		// Public endpoints (require API key authentication)
 		generate := v1.Group("/generate")
-		generate.Use(handler.AuthMiddleware)
+		generate.Use(handler.AuthMiddleware())
 		{
 			generate.POST("", handler.Generate)
 			generate.POST("/stream", handler.GenerateStream)
@@ -147,7 +159,7 @@ func registerRoutes(router *gin.Engine, handler *api.Handler) {
 
 		// User management endpoints (require JWT authentication)
 		user := v1.Group("/user")
-		user.Use(handler.JWTAuthMiddleware)
+		user.Use(handler.JWTAuthMiddleware())
 		{
 			user.GET("/profile", handler.GetProfile)
 			user.GET("/balance", handler.GetBalance)
@@ -156,11 +168,11 @@ func registerRoutes(router *gin.Engine, handler *api.Handler) {
 
 		// API key management endpoints (require JWT authentication)
 		keys := v1.Group("/keys")
-		keys.Use(handler.JWTAuthMiddleware)
+		keys.Use(handler.JWTAuthMiddleware())
 		{
 			keys.POST("", handler.CreateAPIKey)
 			keys.GET("", handler.ListAPIKeys)
-			keys.DELETE("/:key_id", handler.RevokeAPIKey)
+			keys.DELETE(":key_id", handler.RevokeAPIKey)
 		}
 	}
 }

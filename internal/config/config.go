@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
+	"github.com/subosito/gotenv"
 )
 
 // Config holds all configuration for the AptRouter API
@@ -80,25 +81,22 @@ type OptimizationConfig struct {
 
 // LoadConfig loads configuration from environment variables and .env file
 func LoadConfig() (*Config, error) {
-	viper.SetConfigName(".env")
-	viper.SetConfigType("env")
-	viper.AddConfigPath(".")
-	viper.AddConfigPath("./config")
-	viper.AddConfigPath("../config")
-	viper.AddConfigPath("../../config")
+	// First, try to load .env file using godotenv
+	if err := gotenv.Load(); err != nil {
+		// .env file not found, continue with environment variables only
+	}
 
-	// Set default values
+	// Set default values first
 	setDefaults()
 
-	// Read environment variables
+	// Configure Viper to read environment variables
 	viper.AutomaticEnv()
 
-	// Read .env file if it exists
-	if err := viper.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-			return nil, fmt.Errorf("failed to read config file: %w", err)
-		}
-	}
+	// Map environment variables to config structure
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+
+	// Bind environment variables to config fields
+	bindEnvVars()
 
 	var config Config
 	if err := viper.Unmarshal(&config); err != nil {
@@ -111,6 +109,47 @@ func LoadConfig() (*Config, error) {
 	}
 
 	return &config, nil
+}
+
+// bindEnvVars binds environment variables to config fields
+func bindEnvVars() {
+	// Server config
+	viper.BindEnv("server.port", "PORT")
+	viper.BindEnv("server.env", "ENV")
+
+	// Supabase config
+	viper.BindEnv("supabase.url", "SUPABASE_URL")
+	viper.BindEnv("supabase.service_role_key", "SUPABASE_SERVICE_ROLE_KEY")
+	viper.BindEnv("supabase.anon_key", "SUPABASE_ANON_KEY")
+
+	// Cache config
+	viper.BindEnv("cache.default_expiration", "CACHE_DEFAULT_EXPIRATION")
+	viper.BindEnv("cache.cleanup_interval", "CACHE_CLEANUP_INTERVAL")
+
+	// LLM config
+	viper.BindEnv("llm.google_api_key", "GOOGLE_API_KEY")
+	viper.BindEnv("llm.openai_api_key", "OPENAI_API_KEY")
+	viper.BindEnv("llm.anthropic_api_key", "ANTHROPIC_API_KEY")
+
+	// Security config
+	viper.BindEnv("security.jwt_secret", "JWT_SECRET")
+	viper.BindEnv("security.api_key_salt", "API_KEY_SALT")
+
+	// Logging config
+	viper.BindEnv("logging.level", "LOG_LEVEL")
+	viper.BindEnv("logging.format", "LOG_FORMAT")
+
+	// Rate limit config
+	viper.BindEnv("rate_limit.requests_per_minute", "RATE_LIMIT_REQUESTS_PER_MINUTE")
+	viper.BindEnv("rate_limit.burst", "RATE_LIMIT_BURST")
+
+	// Cost config
+	viper.BindEnv("cost.max_cost_per_request_usd", "MAX_COST_PER_REQUEST_USD")
+	viper.BindEnv("cost.default_user_balance_usd", "DEFAULT_USER_BALANCE_USD")
+
+	// Optimization config
+	viper.BindEnv("optimization.enabled", "OPTIMIZATION_ENABLED")
+	viper.BindEnv("optimization.fallback_on_optimization_failure", "FALLBACK_ON_OPTIMIZATION_FAILURE")
 }
 
 // setDefaults sets default values for configuration
@@ -138,9 +177,6 @@ func setDefaults() {
 	// Optimization defaults
 	viper.SetDefault("OPTIMIZATION_ENABLED", "true")
 	viper.SetDefault("FALLBACK_ON_OPTIMIZATION_FAILURE", "true")
-
-	// Map environment variables to config structure
-	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 }
 
 // validateConfig validates that all required configuration fields are present

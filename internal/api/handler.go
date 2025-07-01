@@ -1,7 +1,11 @@
 package api
 
 import (
+	"context"
+	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/apt-router/api/internal/config"
 	"github.com/apt-router/api/internal/pricing"
@@ -12,10 +16,11 @@ import (
 
 // Handler handles all API requests
 type Handler struct {
-	config         *config.Config
-	supabaseClient *supabase.Client
-	cache          *cache.Cache
-	pricingService *pricing.Service
+	config            *config.Config
+	supabaseClient    *supabase.Client
+	cache             *cache.Cache
+	pricingService    *pricing.Service
+	generationService *GenerationService
 }
 
 // NewHandler creates a new API handler
@@ -25,11 +30,14 @@ func NewHandler(
 	cache *cache.Cache,
 	pricingService *pricing.Service,
 ) *Handler {
+	generationService := NewGenerationService(cfg, supabaseClient, cache, pricingService)
+
 	return &Handler{
-		config:         cfg,
-		supabaseClient: supabaseClient,
-		cache:          cache,
-		pricingService: pricingService,
+		config:            cfg,
+		supabaseClient:    supabaseClient,
+		cache:             cache,
+		pricingService:    pricingService,
+		generationService: generationService,
 	}
 }
 
@@ -43,31 +51,473 @@ func (h *Handler) HealthCheck(c *gin.Context) {
 }
 
 // AuthMiddleware authenticates API key requests
-func (h *Handler) AuthMiddleware(c *gin.Context) {
-	// TODO: Implement API key authentication
-	c.Next()
+func (h *Handler) AuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		requestID := h.getRequestID(c)
+		logger := h.getLogger(c)
+
+		// Extract API key from Authorization header
+		authHeader := c.GetHeader("Authorization")
+		var apiKey string
+
+		if authHeader != "" {
+			// Handle "Bearer <token>" format
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				apiKey = strings.TrimPrefix(authHeader, "Bearer ")
+			} else {
+				// Handle direct API key format
+				apiKey = authHeader
+			}
+		}
+
+		// For development/testing, accept any API key and create a mock context
+		// In production, this would validate the API key against the database
+		if apiKey == "" {
+			logger.Warn("No API key provided, using mock key for development")
+			apiKey = "mock-api-key-for-development"
+		}
+
+		// Hash the API key for logging (don't log the actual key)
+		keyHash := h.hashAPIKey(apiKey)
+		logger.Info("API key authentication", "key_hash", keyHash[:8]+"...")
+
+		// Create request context
+		requestCtx := &RequestContext{
+			RequestID: requestID,
+			UserID:    "mock-user-id",
+			APIKeyID:  "mock-api-key-id",
+			PricingTier: pricing.PricingTier{
+				ID:                             1,
+				TierName:                       "free",
+				MinMonthlyRequests:             0,
+				InputSavingsRateUSDPerMillion:  0.50,
+				OutputSavingsRateUSDPerMillion: 1.50,
+			},
+			Logger: logger,
+		}
+
+		// Store request context in Gin context
+		c.Set("request_context", requestCtx)
+
+		// Continue to next middleware/handler
+		c.Next()
+	}
 }
 
 // JWTAuthMiddleware authenticates JWT requests
-func (h *Handler) JWTAuthMiddleware(c *gin.Context) {
+func (h *Handler) JWTAuthMiddleware() gin.HandlerFunc {
 	// TODO: Implement JWT authentication
-	c.Next()
+	return func(c *gin.Context) {
+		c.Next()
+	}
+}
+
+// GenerateRequest represents a text generation request from HTTP
+type GenerateRequest struct {
+	Model       string                 `json:"model" binding:"required"`
+	Prompt      string                 `json:"prompt" binding:"required"`
+	MaxTokens   *int                   `json:"max_tokens,omitempty"`
+	Temperature *float64               `json:"temperature,omitempty"`
+	TopP        *float64               `json:"top_p,omitempty"`
+	Stream      *bool                  `json:"stream,omitempty"`
+	Extra       map[string]interface{} `json:"extra,omitempty"`
+	// BYOK fields
+	OpenAIAPIKey    string `json:"openai_api_key,omitempty"`
+	AnthropicAPIKey string `json:"anthropic_api_key,omitempty"`
+	GoogleAPIKey    string `json:"google_api_key,omitempty"`
+	// Optimization mode: "context" (default) or "efficiency"
+	OptimizationMode string `json:"optimization_mode,omitempty"`
+}
+
+// GenerateResponse represents a text generation response for HTTP
+type GenerateResponse struct {
+	ID           string                 `json:"id"`
+	Text         string                 `json:"text"`
+	Model        string                 `json:"model"`
+	Provider     string                 `json:"provider"`
+	Usage        *UsageInfo             `json:"usage,omitempty"`
+	FinishReason string                 `json:"finish_reason,omitempty"`
+	CreatedAt    int64                  `json:"created_at"`
+	Metadata     map[string]interface{} `json:"metadata,omitempty"`
+}
+
+// UsageInfo contains token usage information for HTTP responses
+type UsageInfo struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+	TotalTokens  int `json:"total_tokens"`
 }
 
 // Generate handles the main generation endpoint
 func (h *Handler) Generate(c *gin.Context) {
-	// TODO: Implement the main generation logic
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Generate endpoint - not implemented yet",
-	})
+	// Get request context
+	requestCtx, exists := h.getRequestContext(c)
+	if !exists {
+		// For testing, create a mock request context if one doesn't exist
+		requestID := h.getRequestID(c)
+		logger := h.getLogger(c)
+
+		requestCtx = &RequestContext{
+			RequestID: requestID,
+			UserID:    "mock-user-id",
+			APIKeyID:  "mock-api-key-id",
+			PricingTier: pricing.PricingTier{
+				ID:                             1,
+				TierName:                       "free",
+				MinMonthlyRequests:             0,
+				InputSavingsRateUSDPerMillion:  0.50,
+				OutputSavingsRateUSDPerMillion: 1.50,
+			},
+			Logger: logger,
+		}
+
+		// Store it for future use
+		c.Set("request_context", requestCtx)
+	}
+
+	// Parse request
+	var req GenerateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Invalid request format: " + err.Error(),
+		})
+		return
+	}
+
+	// Convert HTTP request to service request
+	serviceReq := &GenerationRequest{
+		Model:            req.Model,
+		Prompt:           req.Prompt,
+		MaxTokens:        h.getIntValue(req.MaxTokens, 1000),
+		Temperature:      h.getFloatValue(req.Temperature, 0.7),
+		TopP:             h.getFloatValue(req.TopP, 1.0),
+		Stream:           h.getBoolValue(req.Stream, false),
+		Extra:            req.Extra,
+		OpenAIAPIKey:     req.OpenAIAPIKey,
+		AnthropicAPIKey:  req.AnthropicAPIKey,
+		GoogleAPIKey:     req.GoogleAPIKey,
+		OptimizationMode: req.OptimizationMode,
+	}
+
+	// Call service layer
+	result, err := h.generationService.Generate(c.Request.Context(), serviceReq, requestCtx)
+	if err != nil {
+		requestCtx.Logger.Error("Generation failed", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	// Convert service response to HTTP response
+	httpResp := &GenerateResponse{
+		ID:           result.Response.ID,
+		Text:         result.Response.Text,
+		Model:        result.Response.Model,
+		Provider:     result.Response.Provider,
+		FinishReason: result.Response.FinishReason,
+		CreatedAt:    result.Response.CreatedAt,
+		Metadata:     result.Response.Metadata,
+	}
+
+	// Convert usage info
+	if result.Response.Usage != nil {
+		httpResp.Usage = &UsageInfo{
+			InputTokens:  result.Response.Usage.InputTokens,
+			OutputTokens: result.Response.Usage.OutputTokens,
+			TotalTokens:  result.Response.Usage.TotalTokens,
+		}
+	}
+
+	// Log the request
+	err = h.logRequest(c.Request.Context(), requestCtx, serviceReq, result)
+	if err != nil {
+		requestCtx.Logger.Error("Failed to log request", "error", err)
+		// Don't fail the request, just log the error
+	}
+
+	// Charge the user
+	err = h.chargeUser(c.Request.Context(), requestCtx, result.Response.Metadata["cost"].(float64))
+	if err != nil {
+		requestCtx.Logger.Error("Failed to charge user", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to process payment",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, httpResp)
+}
+
+// getIntValue safely extracts int value from pointer
+func (h *Handler) getIntValue(ptr *int, defaultValue int) int {
+	if ptr != nil {
+		return *ptr
+	}
+	return defaultValue
+}
+
+// getFloatValue safely extracts float64 value from pointer
+func (h *Handler) getFloatValue(ptr *float64, defaultValue float64) float64 {
+	if ptr != nil {
+		return *ptr
+	}
+	return defaultValue
+}
+
+// getBoolValue safely extracts bool value from pointer
+func (h *Handler) getBoolValue(ptr *bool, defaultValue bool) bool {
+	if ptr != nil {
+		return *ptr
+	}
+	return defaultValue
+}
+
+// logRequest logs the generation request to the database
+func (h *Handler) logRequest(ctx context.Context, requestCtx *RequestContext, req *GenerationRequest, result *GenerationResult) error {
+	// TODO: Implement database logging using Supabase
+	// For now, just log to console
+	requestCtx.Logger.Info("Request logged",
+		"user_id", requestCtx.UserID,
+		"model", req.Model,
+		"input_tokens", result.Response.Usage.InputTokens,
+		"output_tokens", result.Response.Usage.OutputTokens,
+		"cost", result.Response.Metadata["cost"],
+		"was_optimized", result.WasOptimized,
+		"optimization_status", result.OptimizationStatus,
+		"fallback_reason", result.FallbackReason,
+	)
+	return nil
+}
+
+// chargeUser charges the user for the request
+func (h *Handler) chargeUser(ctx context.Context, requestCtx *RequestContext, cost float64) error {
+	// TODO: Implement database charging using Supabase
+	// For now, just log to console
+	requestCtx.Logger.Info("User charged",
+		"user_id", requestCtx.UserID,
+		"cost", cost,
+	)
+	return nil
 }
 
 // GenerateStream handles the streaming generation endpoint
 func (h *Handler) GenerateStream(c *gin.Context) {
-	// TODO: Implement the streaming generation logic
-	c.JSON(http.StatusOK, gin.H{
-		"message": "GenerateStream endpoint - not implemented yet",
-	})
+	// Get request context
+	requestCtx, exists := h.getRequestContext(c)
+	if !exists {
+		// For testing, create a mock request context if one doesn't exist
+		requestID := h.getRequestID(c)
+		logger := h.getLogger(c)
+
+		requestCtx = &RequestContext{
+			RequestID: requestID,
+			UserID:    "mock-user-id",
+			APIKeyID:  "mock-api-key-id",
+			PricingTier: pricing.PricingTier{
+				ID:                             1,
+				TierName:                       "free",
+				MinMonthlyRequests:             0,
+				InputSavingsRateUSDPerMillion:  0.50,
+				OutputSavingsRateUSDPerMillion: 1.50,
+			},
+			Logger: logger,
+		}
+
+		// Store it for future use
+		c.Set("request_context", requestCtx)
+	}
+
+	// Parse request
+	var req GenerateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Invalid request format: " + err.Error(),
+		})
+		return
+	}
+
+	// Convert HTTP request to service request
+	serviceReq := &GenerationRequest{
+		Model:            req.Model,
+		Prompt:           req.Prompt,
+		MaxTokens:        h.getIntValue(req.MaxTokens, 1000),
+		Temperature:      h.getFloatValue(req.Temperature, 0.7),
+		TopP:             h.getFloatValue(req.TopP, 1.0),
+		Stream:           true, // Force streaming for this endpoint
+		Extra:            req.Extra,
+		OpenAIAPIKey:     req.OpenAIAPIKey,
+		AnthropicAPIKey:  req.AnthropicAPIKey,
+		GoogleAPIKey:     req.GoogleAPIKey,
+		OptimizationMode: req.OptimizationMode,
+	}
+
+	// Call service layer for streaming
+	streamResp, err := h.generationService.GenerateStream(c.Request.Context(), serviceReq, requestCtx)
+	if err != nil {
+		requestCtx.Logger.Error("Streaming generation failed", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	// Set headers for streaming (all available before streaming)
+	if streamResp.Metadata != nil {
+		if inputTokens, ok := streamResp.Metadata["input_tokens"]; ok {
+			c.Header("X-Input-Tokens", inputTokens)
+		}
+		if wasOptimized, ok := streamResp.Metadata["was_optimized"]; ok {
+			c.Header("X-Was-Optimized", wasOptimized)
+		}
+		if optimizationStatus, ok := streamResp.Metadata["optimization_status"]; ok {
+			c.Header("X-Optimization-Status", optimizationStatus)
+		}
+	}
+	// Set optimization headers from EnhancedStreamReader if possible
+	if enhanced, ok := streamResp.Stream.(*EnhancedStreamReader); ok {
+		if enhanced.promptOptimizationResult != nil {
+			c.Header("X-Input-Tokens-Original", fmt.Sprintf("%d", enhanced.promptOptimizationResult.OriginalTokens))
+			c.Header("X-Input-Tokens-Saved", fmt.Sprintf("%d", enhanced.promptOptimizationResult.TokensSaved))
+		} else {
+			c.Header("X-Input-Tokens-Original", fmt.Sprintf("%d", enhanced.inputTokens))
+			c.Header("X-Input-Tokens-Saved", "0")
+		}
+	}
+
+	// Set up streaming response headers
+	c.Header("Content-Type", "text/plain; charset=utf-8")
+	c.Header("Transfer-Encoding", "chunked")
+	c.Writer.WriteHeader(http.StatusOK)
+	c.Writer.Flush()
+
+	// Stream the response in real-time
+	buffer := make([]byte, 1024)
+	var fullResponse strings.Builder
+
+	for {
+		n, err := streamResp.Stream.Read(buffer)
+		if n > 0 {
+			chunk := string(buffer[:n])
+
+			// Accumulate the full response for processing
+			fullResponse.WriteString(chunk)
+
+			// Send this chunk immediately to the user
+			c.Writer.Write(buffer[:n])
+			c.Writer.Flush() // Force immediate transmission
+		}
+		if err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+			requestCtx.Logger.Error("Stream read error", "error", err)
+			break
+		}
+	}
+
+	// Close the stream (this will trigger usage logging in EnhancedStreamReader)
+	streamResp.Stream.Close()
+
+	// Get the full response content
+	fullContent := fullResponse.String()
+
+	// Parse saved_tokens estimate from the response if present
+	savedTokensEstimate := 0
+	cleanedContent := fullContent
+	if idx := strings.LastIndex(fullContent, "saved_tokens="); idx != -1 {
+		startIdx := idx + len("saved_tokens=")
+		endIdx := startIdx
+		for endIdx < len(fullContent) && fullContent[endIdx] >= '0' && fullContent[endIdx] <= '9' {
+			endIdx++
+		}
+		if endIdx > startIdx {
+			if estimate, err := strconv.Atoi(fullContent[startIdx:endIdx]); err == nil {
+				savedTokensEstimate = estimate
+				requestCtx.Logger.Info("Parsed saved_tokens estimate from response", "estimate", savedTokensEstimate)
+			}
+		}
+		// Remove the saved_tokens pattern from the content
+		cleanedContent = strings.TrimSpace(fullContent[:idx])
+
+		// Send a backspace sequence to remove the saved_tokens pattern from the user's view
+		// This is a bit hacky but works for terminal output
+		backspaceCount := len(fullContent) - len(cleanedContent)
+		if backspaceCount > 0 {
+			backspaceSequence := strings.Repeat("\b \b", backspaceCount)
+			c.Writer.Write([]byte(backspaceSequence))
+			c.Writer.Flush()
+		}
+	}
+
+	// After streaming, set output token and optimization headers if possible
+	if enhanced, ok := streamResp.Stream.(*EnhancedStreamReader); ok {
+		requestCtx.Logger.Info("Setting optimization headers",
+			"output_tokens", enhanced.outputTokens,
+			"has_optimization_result", enhanced.promptOptimizationResult != nil)
+
+		c.Header("X-Output-Tokens", fmt.Sprintf("%d", enhanced.outputTokens))
+		if enhanced.promptOptimizationResult != nil {
+			requestCtx.Logger.Info("Setting optimization result headers",
+				"original_tokens", enhanced.promptOptimizationResult.OriginalTokens,
+				"tokens_saved", enhanced.promptOptimizationResult.TokensSaved)
+			c.Header("X-Input-Tokens-Original", fmt.Sprintf("%d", enhanced.promptOptimizationResult.OriginalTokens))
+			c.Header("X-Input-Tokens-Saved", fmt.Sprintf("%d", enhanced.promptOptimizationResult.TokensSaved))
+		} else {
+			// Set default values if no optimization result
+			c.Header("X-Input-Tokens-Original", fmt.Sprintf("%d", enhanced.inputTokens))
+			c.Header("X-Input-Tokens-Saved", "0")
+		}
+
+		// Calculate total cost
+		totalCost := enhanced.calculateCost(enhanced.inputTokens, enhanced.outputTokens)
+
+		// Create metadata for logging and headers (not sent to user)
+		metadata := map[string]interface{}{
+			"input_tokens":        enhanced.inputTokens,
+			"output_tokens":       enhanced.outputTokens,
+			"total_tokens":        enhanced.inputTokens + enhanced.outputTokens,
+			"cost":                totalCost,
+			"was_optimized":       enhanced.wasOptimized,
+			"optimization_status": enhanced.optimizationStatus,
+			"fallback_reason":     enhanced.fallbackReason,
+		}
+
+		if enhanced.promptOptimizationResult != nil {
+			metadata["input_tokens_original"] = enhanced.promptOptimizationResult.OriginalTokens
+			metadata["tokens_saved"] = enhanced.promptOptimizationResult.TokensSaved
+		} else {
+			metadata["input_tokens_original"] = enhanced.inputTokens
+			metadata["tokens_saved"] = 0
+		}
+
+		// Add output optimization estimate if available
+		if savedTokensEstimate > 0 {
+			metadata["output_tokens_saved_estimate"] = savedTokensEstimate
+		}
+
+		// Log the metadata instead of sending it to user
+		requestCtx.Logger.Info("Streaming metadata", "metadata", metadata)
+
+		// Set additional headers with metadata info
+		c.Header("X-Total-Tokens", fmt.Sprintf("%d", enhanced.inputTokens+enhanced.outputTokens))
+		c.Header("X-Cost", fmt.Sprintf("%.6f", totalCost))
+		c.Header("X-Was-Optimized", fmt.Sprintf("%t", enhanced.wasOptimized))
+		c.Header("X-Optimization-Status", enhanced.optimizationStatus)
+		if enhanced.fallbackReason != "" {
+			c.Header("X-Fallback-Reason", enhanced.fallbackReason)
+		}
+		if savedTokensEstimate > 0 {
+			c.Header("X-Output-Tokens-Saved-Estimate", fmt.Sprintf("%d", savedTokensEstimate))
+		}
+	}
+
+	// Log the streaming request completion
+	requestCtx.Logger.Info("Streaming request completed",
+		"user_id", requestCtx.UserID,
+		"model", req.Model,
+		"streaming", true,
+	)
 }
 
 // GetProfile handles getting user profile
