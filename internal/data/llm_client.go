@@ -1,4 +1,4 @@
-package llm
+package data
 
 import (
 	"context"
@@ -13,9 +13,6 @@ type LLMClient interface {
 
 	// GenerateStream generates text with streaming response
 	GenerateStream(ctx context.Context, params map[string]interface{}) (*StreamResponse, error)
-
-	// CountTokens counts the number of tokens in the given text
-	CountTokens(text string) (int, error)
 }
 
 // ProviderError represents errors from LLM providers with additional context

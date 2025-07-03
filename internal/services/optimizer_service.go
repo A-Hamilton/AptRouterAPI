@@ -1,4 +1,4 @@
-package llm
+package services
 
 import (
 	"context"
@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pkoukk/tiktoken-go"
+	"github.com/apt-router/api/internal/data"
 )
 
 // OptimizationResult holds detailed information about optimization
@@ -24,18 +24,21 @@ type OptimizationResult struct {
 	FallbackReason    string  `json:"fallback_reason,omitempty"`
 	OptimizedPrompt   string  `json:"optimized_prompt,omitempty"`
 	OptimizedResponse string  `json:"optimized_response,omitempty"`
+	// New fields for actual API token counts
+	Gemma3InputTokens    int `json:"gemma3_input_tokens,omitempty"`     // Actual input tokens from Gemma 3 API response
+	UserModelInputTokens int `json:"user_model_input_tokens,omitempty"` // Actual input tokens from user's model API response
 }
 
 // Optimizer handles token optimization using a lightweight model
 type Optimizer struct {
-	client LLMClient
+	client data.LLMClient
 	model  string
 }
 
 // NewOptimizer creates a new optimizer instance
 func NewOptimizer(model string, apiKey string) (*Optimizer, error) {
 	// Use Google's Gemini Flash model for optimization (lightweight and efficient)
-	client, err := NewGoogleClient(model, apiKey)
+	client, err := data.NewGoogleClient(model, apiKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create optimizer client: %w", err)
 	}
@@ -54,80 +57,74 @@ func (o *Optimizer) OptimizePrompt(ctx context.Context, originalPrompt string) (
 		WasOptimized:     false,
 	}
 
-	// Count original tokens
-	originalTokens, err := o.CountTokens(originalPrompt)
-	if err != nil {
-		slog.Warn("Failed to count original tokens", "error", err)
-		originalTokens = len(originalPrompt) / 4 // Rough estimate
-	}
-	result.OriginalTokens = originalTokens
-
-	// Apply rule-based optimizations first
+	// Apply rule-based optimizations first (no API call)
 	ruleOptimized := o.applyRuleBasedOptimizations(originalPrompt)
 	if ruleOptimized != originalPrompt {
 		result.OptimizedText = ruleOptimized
 		result.WasOptimized = true
 		result.OptimizationType = "rule_based"
-	} else {
-		// Use AI-based optimization
-		optimizationPrompt := o.buildPromptOptimizationPrompt(originalPrompt)
-
-		params := map[string]interface{}{
-			"prompt":      optimizationPrompt,
-			"max_tokens":  300,
-			"temperature": 0.1, // Very low temperature for consistent optimization
+		// Use rough estimation for rule-based optimization (no API call)
+		result.OriginalTokens = len(originalPrompt) / 4
+		result.OptimizedTokens = len(ruleOptimized) / 4
+		result.TokensSaved = result.OriginalTokens - result.OptimizedTokens
+		if result.OriginalTokens > 0 {
+			result.SavingsPercent = float64(result.TokensSaved) / float64(result.OriginalTokens) * 100
 		}
-
-		resp, err := o.client.GenerateWithParams(ctx, params)
-		if err != nil {
-			slog.Warn("AI prompt optimization failed, using rule-based", "error", err)
-			result.FallbackReason = "ai_optimization_failed"
-			result.OptimizedText = ruleOptimized
-			result.WasOptimized = ruleOptimized != originalPrompt
-			if result.WasOptimized {
-				result.OptimizationType = "rule_based_fallback"
-			}
-		} else {
-			optimizedPrompt := strings.TrimSpace(resp.Text)
-			// Clean up the response - remove quotes and extra formatting
-			optimizedPrompt = o.cleanOptimizedResponse(optimizedPrompt)
-
-			if optimizedPrompt != "" && optimizedPrompt != originalPrompt {
-				result.OptimizedText = optimizedPrompt
-				result.WasOptimized = true
-				result.OptimizationType = "ai_based"
-				result.OptimizedPrompt = optimizedPrompt
-			} else {
-				result.OptimizedText = ruleOptimized
-				result.WasOptimized = ruleOptimized != originalPrompt
-				if result.WasOptimized {
-					result.OptimizationType = "rule_based_fallback"
-				}
-			}
-		}
+		return result, nil
 	}
 
-	// Count optimized tokens
-	optimizedTokens, err := o.CountTokens(result.OptimizedText)
+	// Use AI-based optimization - ONLY ONE API CALL to Gemma 3
+	optimizationPrompt := o.buildPromptOptimizationPrompt(originalPrompt)
+	params := map[string]interface{}{
+		"prompt":      optimizationPrompt,
+		"max_tokens":  300,
+		"temperature": 0.1,
+	}
+
+	resp, err := o.client.GenerateWithParams(ctx, params)
 	if err != nil {
-		slog.Warn("Failed to count optimized tokens", "error", err)
-		optimizedTokens = len(result.OptimizedText) / 4 // Rough estimate
+		slog.Warn("AI prompt optimization failed, using original prompt", "error", err)
+		result.FallbackReason = "ai_optimization_failed"
+		result.OptimizedText = originalPrompt
+		result.WasOptimized = false
+		result.OriginalTokens = len(originalPrompt) / 4
+		result.OptimizedTokens = result.OriginalTokens
+		result.TokensSaved = 0
+		result.SavingsPercent = 0
+		return result, nil
 	}
-	result.OptimizedTokens = optimizedTokens
 
-	// Calculate savings
-	result.TokensSaved = originalTokens - optimizedTokens
-	if originalTokens > 0 {
-		result.SavingsPercent = float64(result.TokensSaved) / float64(originalTokens) * 100
-	}
+	optimizedPrompt := strings.TrimSpace(resp.Text)
+	optimizedPrompt = o.cleanOptimizedResponse(optimizedPrompt)
 
-	if result.WasOptimized {
-		slog.Info("Prompt optimization completed",
-			"original_tokens", originalTokens,
-			"optimized_tokens", optimizedTokens,
+	if optimizedPrompt != "" && optimizedPrompt != originalPrompt {
+		result.OptimizedText = optimizedPrompt
+		result.WasOptimized = true
+		result.OptimizationType = "ai_based"
+		result.OptimizedPrompt = optimizedPrompt
+
+		// Use rough estimation for AI-based optimization (no additional API call)
+		result.OriginalTokens = len(originalPrompt) / 4
+		result.OptimizedTokens = len(optimizedPrompt) / 4
+		result.TokensSaved = result.OriginalTokens - result.OptimizedTokens
+		if result.OriginalTokens > 0 {
+			result.SavingsPercent = float64(result.TokensSaved) / float64(result.OriginalTokens) * 100
+		}
+
+		slog.Info("Prompt optimization completed with ONE API call to Gemma 3",
+			"original_tokens", result.OriginalTokens,
+			"optimized_tokens", result.OptimizedTokens,
 			"tokens_saved", result.TokensSaved,
 			"savings_percent", fmt.Sprintf("%.1f%%", result.SavingsPercent),
-			"optimization_type", result.OptimizationType)
+			"optimization_type", result.OptimizationType,
+			"api_calls", "1")
+	} else {
+		result.OptimizedText = originalPrompt
+		result.WasOptimized = false
+		result.OriginalTokens = len(originalPrompt) / 4
+		result.OptimizedTokens = result.OriginalTokens
+		result.TokensSaved = 0
+		result.SavingsPercent = 0
 	}
 
 	return result, nil
@@ -141,106 +138,101 @@ func (o *Optimizer) OptimizeResponse(ctx context.Context, originalResponse strin
 		WasOptimized:     false,
 	}
 
-	// Count original tokens
-	originalTokens, err := o.CountTokens(originalResponse)
-	if err != nil {
-		slog.Warn("Failed to count original tokens", "error", err)
-		originalTokens = len(originalResponse) / 4 // Rough estimate
-	}
-	result.OriginalTokens = originalTokens
-
-	// Apply rule-based optimizations first
+	// Apply rule-based optimizations first (no API call)
 	ruleOptimized := o.applyRuleBasedOptimizations(originalResponse)
 	if ruleOptimized != originalResponse {
 		result.OptimizedText = ruleOptimized
 		result.WasOptimized = true
 		result.OptimizationType = "rule_based"
-	} else {
-		// Use AI-based optimization with token savings estimation
-		optimizationPrompt := o.buildResponseOptimizationPromptWithEstimate(originalResponse)
-
-		params := map[string]interface{}{
-			"prompt":      optimizationPrompt,
-			"max_tokens":  800,
-			"temperature": 0.1, // Very low temperature for consistent optimization
+		// Use rough estimation for rule-based optimization (no API call)
+		result.OriginalTokens = len(originalResponse) / 4
+		result.OptimizedTokens = len(ruleOptimized) / 4
+		result.TokensSaved = result.OriginalTokens - result.OptimizedTokens
+		if result.OriginalTokens > 0 {
+			result.SavingsPercent = float64(result.TokensSaved) / float64(result.OriginalTokens) * 100
 		}
-
-		resp, err := o.client.GenerateWithParams(ctx, params)
-		if err != nil {
-			slog.Warn("AI response optimization failed, using rule-based", "error", err)
-			result.FallbackReason = "ai_optimization_failed"
-			result.OptimizedText = ruleOptimized
-			result.WasOptimized = ruleOptimized != originalResponse
-			if result.WasOptimized {
-				result.OptimizationType = "rule_based_fallback"
-			}
-		} else {
-			optimizedResponse := strings.TrimSpace(resp.Text)
-			// Clean up the response - remove quotes and extra formatting
-			optimizedResponse = o.cleanOptimizedResponse(optimizedResponse)
-
-			// Parse [tokens_saved]=... at the end if present
-			tokensSavedEstimate := 0
-			parsedText := optimizedResponse
-			if idx := strings.LastIndex(optimizedResponse, "[tokens_saved]="); idx != -1 {
-				endIdx := idx + len("[tokens_saved]=")
-				numStr := ""
-				for i := endIdx; i < len(optimizedResponse); i++ {
-					if optimizedResponse[i] >= '0' && optimizedResponse[i] <= '9' {
-						numStr += string(optimizedResponse[i])
-					} else {
-						break
-					}
-				}
-				if numStr != "" {
-					tokensSavedEstimate, _ = strconv.Atoi(numStr)
-				}
-				parsedText = strings.TrimSpace(optimizedResponse[:idx])
-			}
-
-			if parsedText != "" && parsedText != originalResponse {
-				result.OptimizedText = parsedText
-				result.WasOptimized = true
-				result.OptimizationType = "ai_based"
-				// Attach the model's estimate
-				result.FallbackReason = "model_estimate"
-				// Add to result as OutputTokensSavedEstimate
-				result.TokensSaved = tokensSavedEstimate // This is the model's estimate
-				result.OptimizedTokens = 0               // Not known, but can be counted below
-				result.SavingsPercent = 0                // Not known, but can be counted below
-				result.OptimizationType = "ai_based_with_estimate"
-				result.OptimizedResponse = optimizedResponse
-			} else {
-				result.OptimizedText = ruleOptimized
-				result.WasOptimized = ruleOptimized != originalResponse
-				if result.WasOptimized {
-					result.OptimizationType = "rule_based_fallback"
-				}
-			}
-		}
+		return result, nil
 	}
 
-	// Count optimized tokens
-	optimizedTokens, err := o.CountTokens(result.OptimizedText)
+	// Use AI-based optimization - ONLY ONE API CALL to Gemma 3
+	optimizationPrompt := o.buildResponseOptimizationPromptWithEstimate(originalResponse)
+
+	params := map[string]interface{}{
+		"prompt":      optimizationPrompt,
+		"max_tokens":  800,
+		"temperature": 0.1, // Very low temperature for consistent optimization
+	}
+
+	resp, err := o.client.GenerateWithParams(ctx, params)
 	if err != nil {
-		slog.Warn("Failed to count optimized tokens", "error", err)
-		optimizedTokens = len(result.OptimizedText) / 4 // Rough estimate
+		slog.Warn("AI response optimization failed, using original response", "error", err)
+		result.FallbackReason = "ai_optimization_failed"
+		result.OptimizedText = originalResponse
+		result.WasOptimized = false
+		result.OriginalTokens = len(originalResponse) / 4
+		result.OptimizedTokens = result.OriginalTokens
+		result.TokensSaved = 0
+		result.SavingsPercent = 0
+		return result, nil
 	}
-	result.OptimizedTokens = optimizedTokens
 
-	// Calculate savings
-	result.TokensSaved = originalTokens - optimizedTokens
-	if originalTokens > 0 {
-		result.SavingsPercent = float64(result.TokensSaved) / float64(originalTokens) * 100
+	optimizedResponse := strings.TrimSpace(resp.Text)
+	// Clean up the response - remove quotes and extra formatting
+	optimizedResponse = o.cleanOptimizedResponse(optimizedResponse)
+
+	// Parse [tokens_saved]=... at the end if present
+	tokensSavedEstimate := 0
+	parsedText := optimizedResponse
+	if idx := strings.LastIndex(optimizedResponse, "[tokens_saved]="); idx != -1 {
+		endIdx := idx + len("[tokens_saved]=")
+		numStr := ""
+		for i := endIdx; i < len(optimizedResponse); i++ {
+			if optimizedResponse[i] >= '0' && optimizedResponse[i] <= '9' {
+				numStr += string(optimizedResponse[i])
+			} else {
+				break
+			}
+		}
+		if numStr != "" {
+			tokensSavedEstimate, _ = strconv.Atoi(numStr)
+		}
+		parsedText = strings.TrimSpace(optimizedResponse[:idx])
 	}
 
-	if result.WasOptimized {
-		slog.Info("Response optimization completed",
-			"original_tokens", originalTokens,
-			"optimized_tokens", optimizedTokens,
+	if parsedText != "" && parsedText != originalResponse {
+		result.OptimizedText = parsedText
+		result.WasOptimized = true
+		result.OptimizationType = "ai_based_with_estimate"
+		result.OptimizedResponse = optimizedResponse
+
+		// Use rough estimation for AI-based optimization (no additional API call)
+		result.OriginalTokens = len(originalResponse) / 4
+		result.OptimizedTokens = len(parsedText) / 4
+		result.TokensSaved = result.OriginalTokens - result.OptimizedTokens
+		if result.OriginalTokens > 0 {
+			result.SavingsPercent = float64(result.TokensSaved) / float64(result.OriginalTokens) * 100
+		}
+
+		// If we got a model estimate, use it as additional info
+		if tokensSavedEstimate > 0 {
+			result.FallbackReason = fmt.Sprintf("model_estimate_%d", tokensSavedEstimate)
+		}
+
+		slog.Info("Response optimization completed with ONE API call to Gemma 3",
+			"original_tokens", result.OriginalTokens,
+			"optimized_tokens", result.OptimizedTokens,
 			"tokens_saved", result.TokensSaved,
 			"savings_percent", fmt.Sprintf("%.1f%%", result.SavingsPercent),
-			"optimization_type", result.OptimizationType)
+			"optimization_type", result.OptimizationType,
+			"model_estimate", tokensSavedEstimate,
+			"api_calls", "1")
+	} else {
+		result.OptimizedText = originalResponse
+		result.WasOptimized = false
+		result.OriginalTokens = len(originalResponse) / 4
+		result.OptimizedTokens = result.OriginalTokens
+		result.TokensSaved = 0
+		result.SavingsPercent = 0
 	}
 
 	return result, nil
@@ -343,18 +335,6 @@ func (o *Optimizer) ShouldOptimize(input string, threshold int) bool {
 	return len(input) > threshold
 }
 
-// CountTokens counts tokens using the same method as other clients
-func (o *Optimizer) CountTokens(text string) (int, error) {
-	// Use the same token counting method as other clients
-	encoding, err := tiktoken.GetEncoding("cl100k_base")
-	if err != nil {
-		return 0, fmt.Errorf("failed to get encoding: %w", err)
-	}
-
-	tokens := encoding.Encode(text, nil, nil)
-	return len(tokens), nil
-}
-
 // CalculateOptimizationSavings calculates the token savings from optimization
 func (o *Optimizer) CalculateOptimizationSavings(originalTokens, optimizedTokens int) (int, float64) {
 	if originalTokens == 0 {
@@ -382,85 +362,82 @@ func (o *Optimizer) optimizePromptWithMode(ctx context.Context, originalPrompt s
 		WasOptimized:     false,
 	}
 
-	// Count original tokens
-	originalTokens, err := o.CountTokens(originalPrompt)
-	if err != nil {
-		slog.Warn("Failed to count original tokens", "error", err)
-		originalTokens = len(originalPrompt) / 4 // Rough estimate
-	}
-	result.OriginalTokens = originalTokens
-
-	// Apply rule-based optimizations first
+	// Apply rule-based optimizations first (no API call)
 	ruleOptimized := o.applyRuleBasedOptimizations(originalPrompt)
 	if ruleOptimized != originalPrompt {
 		result.OptimizedText = ruleOptimized
 		result.WasOptimized = true
 		result.OptimizationType = "rule_based"
+		// Use rough estimation for rule-based optimization (no API call)
+		result.OriginalTokens = len(originalPrompt) / 4
+		result.OptimizedTokens = len(ruleOptimized) / 4
+		result.TokensSaved = result.OriginalTokens - result.OptimizedTokens
+		if result.OriginalTokens > 0 {
+			result.SavingsPercent = float64(result.TokensSaved) / float64(result.OriginalTokens) * 100
+		}
+		return result, nil
+	}
+
+	// Use AI-based optimization - ONLY ONE API CALL to Gemma 3
+	var optimizationPrompt string
+	if mode == "efficiency" {
+		optimizationPrompt = o.buildPromptOptimizationPromptEfficiency(originalPrompt)
 	} else {
-		// Use AI-based optimization
-		var optimizationPrompt string
-		if mode == "efficiency" {
-			optimizationPrompt = o.buildPromptOptimizationPromptEfficiency(originalPrompt)
-		} else {
-			optimizationPrompt = o.buildPromptOptimizationPromptContext(originalPrompt)
-		}
-
-		params := map[string]interface{}{
-			"prompt":      optimizationPrompt,
-			"max_tokens":  300,
-			"temperature": 0.1, // Very low temperature for consistent optimization
-		}
-
-		resp, err := o.client.GenerateWithParams(ctx, params)
-		if err != nil {
-			slog.Warn("AI prompt optimization failed, using rule-based", "error", err)
-			result.FallbackReason = "ai_optimization_failed"
-			result.OptimizedText = ruleOptimized
-			result.WasOptimized = ruleOptimized != originalPrompt
-			if result.WasOptimized {
-				result.OptimizationType = "rule_based_fallback"
-			}
-		} else {
-			optimizedPrompt := strings.TrimSpace(resp.Text)
-			// Clean up the response - remove quotes and extra formatting
-			optimizedPrompt = o.cleanOptimizedResponse(optimizedPrompt)
-
-			if optimizedPrompt != "" && optimizedPrompt != originalPrompt {
-				result.OptimizedText = optimizedPrompt
-				result.WasOptimized = true
-				result.OptimizationType = "ai_based"
-				result.OptimizedPrompt = optimizedPrompt
-			} else {
-				result.OptimizedText = ruleOptimized
-				result.WasOptimized = ruleOptimized != originalPrompt
-				if result.WasOptimized {
-					result.OptimizationType = "rule_based_fallback"
-				}
-			}
-		}
+		optimizationPrompt = o.buildPromptOptimizationPromptContext(originalPrompt)
 	}
 
-	// Count optimized tokens
-	optimizedTokens, err := o.CountTokens(result.OptimizedText)
+	params := map[string]interface{}{
+		"prompt":      optimizationPrompt,
+		"max_tokens":  300,
+		"temperature": 0.1, // Very low temperature for consistent optimization
+	}
+
+	resp, err := o.client.GenerateWithParams(ctx, params)
 	if err != nil {
-		slog.Warn("Failed to count optimized tokens", "error", err)
-		optimizedTokens = len(result.OptimizedText) / 4 // Rough estimate
+		slog.Warn("AI prompt optimization failed, using original prompt", "error", err)
+		result.FallbackReason = "ai_optimization_failed"
+		result.OptimizedText = originalPrompt
+		result.WasOptimized = false
+		result.OriginalTokens = len(originalPrompt) / 4
+		result.OptimizedTokens = result.OriginalTokens
+		result.TokensSaved = 0
+		result.SavingsPercent = 0
+		return result, nil
 	}
-	result.OptimizedTokens = optimizedTokens
 
-	// Calculate savings
-	result.TokensSaved = originalTokens - optimizedTokens
-	if originalTokens > 0 {
-		result.SavingsPercent = float64(result.TokensSaved) / float64(originalTokens) * 100
-	}
+	optimizedPrompt := strings.TrimSpace(resp.Text)
+	// Clean up the response - remove quotes and extra formatting
+	optimizedPrompt = o.cleanOptimizedResponse(optimizedPrompt)
 
-	if result.WasOptimized {
-		slog.Info("Prompt optimization completed",
-			"original_tokens", originalTokens,
-			"optimized_tokens", optimizedTokens,
+	if optimizedPrompt != "" && optimizedPrompt != originalPrompt {
+		result.OptimizedText = optimizedPrompt
+		result.WasOptimized = true
+		result.OptimizationType = "ai_based"
+		result.OptimizedPrompt = optimizedPrompt
+
+		// Use rough estimation for AI-based optimization (no additional API call)
+		result.OriginalTokens = len(originalPrompt) / 4
+		result.OptimizedTokens = len(optimizedPrompt) / 4
+		result.TokensSaved = result.OriginalTokens - result.OptimizedTokens
+		if result.OriginalTokens > 0 {
+			result.SavingsPercent = float64(result.TokensSaved) / float64(result.OriginalTokens) * 100
+		}
+
+		slog.Info("Prompt optimization completed with ONE API call to Gemma 3",
+			"original_tokens", result.OriginalTokens,
+			"optimized_tokens", result.OptimizedTokens,
 			"tokens_saved", result.TokensSaved,
 			"savings_percent", fmt.Sprintf("%.1f%%", result.SavingsPercent),
-			"optimization_type", result.OptimizationType)
+			"optimization_type", result.OptimizationType,
+			"mode", mode,
+			"api_calls", "1")
+	} else {
+		result.OptimizedText = originalPrompt
+		result.WasOptimized = false
+		result.OriginalTokens = len(originalPrompt) / 4
+		result.OptimizedTokens = result.OriginalTokens
+		result.TokensSaved = 0
+		result.SavingsPercent = 0
 	}
 
 	return result, nil
@@ -481,111 +458,107 @@ func (o *Optimizer) optimizeResponseWithMode(ctx context.Context, originalRespon
 		WasOptimized:     false,
 	}
 
-	// Count original tokens
-	originalTokens, err := o.CountTokens(originalResponse)
-	if err != nil {
-		slog.Warn("Failed to count original tokens", "error", err)
-		originalTokens = len(originalResponse) / 4 // Rough estimate
-	}
-	result.OriginalTokens = originalTokens
-
-	// Apply rule-based optimizations first
+	// Apply rule-based optimizations first (no API call)
 	ruleOptimized := o.applyRuleBasedOptimizations(originalResponse)
 	if ruleOptimized != originalResponse {
 		result.OptimizedText = ruleOptimized
 		result.WasOptimized = true
 		result.OptimizationType = "rule_based"
+		// Use rough estimation for rule-based optimization (no API call)
+		result.OriginalTokens = len(originalResponse) / 4
+		result.OptimizedTokens = len(ruleOptimized) / 4
+		result.TokensSaved = result.OriginalTokens - result.OptimizedTokens
+		if result.OriginalTokens > 0 {
+			result.SavingsPercent = float64(result.TokensSaved) / float64(result.OriginalTokens) * 100
+		}
+		return result, nil
+	}
+
+	// Use AI-based optimization - ONLY ONE API CALL to Gemma 3
+	var optimizationPrompt string
+	if mode == "efficiency" {
+		optimizationPrompt = o.buildResponseOptimizationPromptEfficiency(originalResponse)
 	} else {
-		// Use AI-based optimization with token savings estimation
-		var optimizationPrompt string
-		if mode == "efficiency" {
-			optimizationPrompt = o.buildResponseOptimizationPromptEfficiency(originalResponse)
-		} else {
-			optimizationPrompt = o.buildResponseOptimizationPromptContext(originalResponse)
-		}
-
-		params := map[string]interface{}{
-			"prompt":      optimizationPrompt,
-			"max_tokens":  800,
-			"temperature": 0.1, // Very low temperature for consistent optimization
-		}
-
-		resp, err := o.client.GenerateWithParams(ctx, params)
-		if err != nil {
-			slog.Warn("AI response optimization failed, using rule-based", "error", err)
-			result.FallbackReason = "ai_optimization_failed"
-			result.OptimizedText = ruleOptimized
-			result.WasOptimized = ruleOptimized != originalResponse
-			if result.WasOptimized {
-				result.OptimizationType = "rule_based_fallback"
-			}
-		} else {
-			optimizedResponse := strings.TrimSpace(resp.Text)
-			// Clean up the response - remove quotes and extra formatting
-			optimizedResponse = o.cleanOptimizedResponse(optimizedResponse)
-
-			// Parse [tokens_saved]=... at the end if present
-			tokensSavedEstimate := 0
-			parsedText := optimizedResponse
-			if idx := strings.LastIndex(optimizedResponse, "[tokens_saved]="); idx != -1 {
-				endIdx := idx + len("[tokens_saved]=")
-				numStr := ""
-				for i := endIdx; i < len(optimizedResponse); i++ {
-					if optimizedResponse[i] >= '0' && optimizedResponse[i] <= '9' {
-						numStr += string(optimizedResponse[i])
-					} else {
-						break
-					}
-				}
-				if numStr != "" {
-					tokensSavedEstimate, _ = strconv.Atoi(numStr)
-				}
-				parsedText = strings.TrimSpace(optimizedResponse[:idx])
-			}
-
-			if parsedText != "" && parsedText != originalResponse {
-				result.OptimizedText = parsedText
-				result.WasOptimized = true
-				result.OptimizationType = "ai_based"
-				// Attach the model's estimate
-				result.FallbackReason = "model_estimate"
-				// Add to result as OutputTokensSavedEstimate
-				result.TokensSaved = tokensSavedEstimate // This is the model's estimate
-				result.OptimizedTokens = 0               // Not known, but can be counted below
-				result.SavingsPercent = 0                // Not known, but can be counted below
-				result.OptimizationType = "ai_based_with_estimate"
-				result.OptimizedResponse = optimizedResponse
-			} else {
-				result.OptimizedText = ruleOptimized
-				result.WasOptimized = ruleOptimized != originalResponse
-				if result.WasOptimized {
-					result.OptimizationType = "rule_based_fallback"
-				}
-			}
-		}
+		optimizationPrompt = o.buildResponseOptimizationPromptContext(originalResponse)
 	}
 
-	// Count optimized tokens
-	optimizedTokens, err := o.CountTokens(result.OptimizedText)
+	params := map[string]interface{}{
+		"prompt":      optimizationPrompt,
+		"max_tokens":  800,
+		"temperature": 0.1, // Very low temperature for consistent optimization
+	}
+
+	resp, err := o.client.GenerateWithParams(ctx, params)
 	if err != nil {
-		slog.Warn("Failed to count optimized tokens", "error", err)
-		optimizedTokens = len(result.OptimizedText) / 4 // Rough estimate
+		slog.Warn("AI response optimization failed, using original response", "error", err)
+		result.FallbackReason = "ai_optimization_failed"
+		result.OptimizedText = originalResponse
+		result.WasOptimized = false
+		result.OriginalTokens = len(originalResponse) / 4
+		result.OptimizedTokens = result.OriginalTokens
+		result.TokensSaved = 0
+		result.SavingsPercent = 0
+		return result, nil
 	}
-	result.OptimizedTokens = optimizedTokens
 
-	// Calculate savings
-	result.TokensSaved = originalTokens - optimizedTokens
-	if originalTokens > 0 {
-		result.SavingsPercent = float64(result.TokensSaved) / float64(originalTokens) * 100
+	optimizedResponse := strings.TrimSpace(resp.Text)
+	// Clean up the response - remove quotes and extra formatting
+	optimizedResponse = o.cleanOptimizedResponse(optimizedResponse)
+
+	// Parse [tokens_saved]=... at the end if present
+	tokensSavedEstimate := 0
+	parsedText := optimizedResponse
+	if idx := strings.LastIndex(optimizedResponse, "[tokens_saved]="); idx != -1 {
+		endIdx := idx + len("[tokens_saved]=")
+		numStr := ""
+		for i := endIdx; i < len(optimizedResponse); i++ {
+			if optimizedResponse[i] >= '0' && optimizedResponse[i] <= '9' {
+				numStr += string(optimizedResponse[i])
+			} else {
+				break
+			}
+		}
+		if numStr != "" {
+			tokensSavedEstimate, _ = strconv.Atoi(numStr)
+		}
+		parsedText = strings.TrimSpace(optimizedResponse[:idx])
 	}
 
-	if result.WasOptimized {
-		slog.Info("Response optimization completed",
-			"original_tokens", originalTokens,
-			"optimized_tokens", optimizedTokens,
+	if parsedText != "" && parsedText != originalResponse {
+		result.OptimizedText = parsedText
+		result.WasOptimized = true
+		result.OptimizationType = "ai_based_with_estimate"
+		result.OptimizedResponse = optimizedResponse
+
+		// Use rough estimation for AI-based optimization (no additional API call)
+		result.OriginalTokens = len(originalResponse) / 4
+		result.OptimizedTokens = len(parsedText) / 4
+		result.TokensSaved = result.OriginalTokens - result.OptimizedTokens
+		if result.OriginalTokens > 0 {
+			result.SavingsPercent = float64(result.TokensSaved) / float64(result.OriginalTokens) * 100
+		}
+
+		// If we got a model estimate, use it as additional info
+		if tokensSavedEstimate > 0 {
+			result.FallbackReason = fmt.Sprintf("model_estimate_%d", tokensSavedEstimate)
+		}
+
+		slog.Info("Response optimization completed with ONE API call to Gemma 3",
+			"original_tokens", result.OriginalTokens,
+			"optimized_tokens", result.OptimizedTokens,
 			"tokens_saved", result.TokensSaved,
 			"savings_percent", fmt.Sprintf("%.1f%%", result.SavingsPercent),
-			"optimization_type", result.OptimizationType)
+			"optimization_type", result.OptimizationType,
+			"mode", mode,
+			"model_estimate", tokensSavedEstimate,
+			"api_calls", "1")
+	} else {
+		result.OptimizedText = originalResponse
+		result.WasOptimized = false
+		result.OriginalTokens = len(originalResponse) / 4
+		result.OptimizedTokens = result.OriginalTokens
+		result.TokensSaved = 0
+		result.SavingsPercent = 0
 	}
 
 	return result, nil
@@ -593,7 +566,7 @@ func (o *Optimizer) optimizeResponseWithMode(ctx context.Context, originalRespon
 
 // buildPromptOptimizationPromptContext creates a context-preserving prompt for input optimization
 func (o *Optimizer) buildPromptOptimizationPromptContext(originalPrompt string) string {
-	return fmt.Sprintf(`Optimize this prompt for token efficiency while preserving context and clarity. Remove unnecessary words but keep essential information.
+	return fmt.Sprintf(`Optimize for tokens. Keep context.
 
 "%s"
 
@@ -602,7 +575,7 @@ Optimized:`, originalPrompt)
 
 // buildPromptOptimizationPromptEfficiency creates an aggressive prompt for input optimization
 func (o *Optimizer) buildPromptOptimizationPromptEfficiency(originalPrompt string) string {
-	return fmt.Sprintf(`Aggressively minimize tokens. Keep only core information. Remove all non-essential context.
+	return fmt.Sprintf(`Minimize tokens. Core info only.
 
 "%s"
 
@@ -611,14 +584,14 @@ Optimized:`, originalPrompt)
 
 // buildResponseOptimizationPromptContext creates a context-preserving prompt for output optimization
 func (o *Optimizer) buildResponseOptimizationPromptContext(originalResponse string) string {
-	return fmt.Sprintf(`Rewrite for token efficiency while preserving context. Append [tokens_saved]=<number> at end.
+	return fmt.Sprintf(`Rewrite efficiently. Append [tokens_saved]=<number>.
 
 %s`, originalResponse)
 }
 
 // buildResponseOptimizationPromptEfficiency creates an aggressive prompt for output optimization
 func (o *Optimizer) buildResponseOptimizationPromptEfficiency(originalResponse string) string {
-	return fmt.Sprintf(`Aggressively minimize tokens. Keep only core info. Append [tokens_saved]=<number> at end.
+	return fmt.Sprintf(`Minimize tokens. Append [tokens_saved]=<number>.
 
 %s`, originalResponse)
 }

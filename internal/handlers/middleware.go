@@ -1,4 +1,4 @@
-package api
+package handlers
 
 import (
 	"context"
@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/apt-router/api/internal/pricing"
+	"github.com/apt-router/api/internal/services"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -28,7 +28,7 @@ type RequestContext struct {
 	RequestID   string
 	UserID      string
 	APIKeyID    string
-	PricingTier pricing.PricingTier
+	PricingTier services.PricingTier
 	Logger      *slog.Logger
 	// Cached user data for performance
 	CachedUser *CachedUserData
@@ -236,12 +236,12 @@ func (h *Handler) updateUserBalance(ctx context.Context, userID string, amount f
 }
 
 // getPricingTierFromCache retrieves pricing tier from cache or loads from Firebase
-func (h *Handler) getPricingTierFromCache(ctx context.Context, tierID string) (*pricing.PricingTier, error) {
+func (h *Handler) getPricingTierFromCache(ctx context.Context, tierID string) (*services.PricingTier, error) {
 	cacheKey := fmt.Sprintf("tier:%s", tierID)
 
 	// Try to get from cache first
 	if cached, found := h.cache.Get(cacheKey); found {
-		if tier, ok := cached.(*pricing.PricingTier); ok {
+		if tier, ok := cached.(*services.PricingTier); ok {
 			return tier, nil
 		}
 	}
@@ -257,9 +257,9 @@ func (h *Handler) getPricingTierFromCache(ctx context.Context, tierID string) (*
 	}
 
 	// Convert Firebase ModelPricing to pricing.ModelPricing
-	customModelPricing := make(map[string]pricing.ModelPricing)
+	customModelPricing := make(map[string]services.ModelPricing)
 	for modelID, modelPricing := range firebaseTier.CustomModelPricing {
-		customModelPricing[modelID] = pricing.ModelPricing{
+		customModelPricing[modelID] = services.ModelPricing{
 			ModelID:               modelPricing.ModelID,
 			Provider:              modelPricing.Provider,
 			InputPricePerMillion:  modelPricing.InputPricePerMillion,
@@ -268,7 +268,7 @@ func (h *Handler) getPricingTierFromCache(ctx context.Context, tierID string) (*
 	}
 
 	// Create pricing tier
-	tier := &pricing.PricingTier{
+	tier := &services.PricingTier{
 		ID:                  firebaseTier.ID,
 		TierName:            firebaseTier.Name,
 		MinMonthlySpend:     firebaseTier.MinMonthlySpend,

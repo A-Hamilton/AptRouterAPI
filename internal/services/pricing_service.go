@@ -1,4 +1,4 @@
-package pricing
+package services
 
 import (
 	"context"
@@ -7,12 +7,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/apt-router/api/internal/firebase"
+	"github.com/apt-router/api/internal/data"
 )
 
-// Service handles pricing calculations and model configurations
-type Service struct {
-	firebaseService *firebase.Service
+// PricingService handles pricing calculations and model configurations
+type PricingService struct {
+	firebaseService *data.Service
 	modelConfigs    map[string]ModelConfig
 	mu              sync.RWMutex
 	lastRefresh     time.Time
@@ -50,9 +50,9 @@ type ModelPricing struct {
 	OutputPricePerMillion float64 `firestore:"output_price_per_million"`
 }
 
-// NewService creates a new pricing service
-func NewService(firebaseService *firebase.Service) *Service {
-	return &Service{
+// NewPricingService creates a new pricing service
+func NewPricingService(firebaseService *data.Service) *PricingService {
+	return &PricingService{
 		firebaseService: firebaseService,
 		modelConfigs:    make(map[string]ModelConfig),
 		cacheTTL:        5 * time.Minute,
@@ -60,7 +60,7 @@ func NewService(firebaseService *firebase.Service) *Service {
 }
 
 // PreCacheData pre-caches model configurations
-func (s *Service) PreCacheData(ctx context.Context) error {
+func (s *PricingService) PreCacheData(ctx context.Context) error {
 	slog.Info("Pre-caching model configurations and pricing tiers")
 
 	// Try to load model configurations from Firestore first
@@ -73,7 +73,7 @@ func (s *Service) PreCacheData(ctx context.Context) error {
 	}
 
 	// Try to load pricing tiers from Firestore
-	if err := s.loadPricingTiersFromFirestore(ctx); err != nil {
+	if err := s.loadPricingTiersFromFirestore(); err != nil {
 		slog.Warn("Failed to load pricing tiers from Firestore, using on-demand loading", "error", err)
 	}
 
@@ -88,7 +88,7 @@ func (s *Service) PreCacheData(ctx context.Context) error {
 }
 
 // loadDefaultModelConfigs loads the default model configurations
-func (s *Service) loadDefaultModelConfigs() {
+func (s *PricingService) loadDefaultModelConfigs() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -153,9 +153,9 @@ func (s *Service) loadDefaultModelConfigs() {
 		IsActive:              true,
 	}
 
-	s.modelConfigs["gpt-4o-2024-05-13"] = ModelConfig{
+	s.modelConfigs["gpt-4o"] = ModelConfig{
 		ID:                    "107",
-		ModelID:               "gpt-4o-2024-05-13",
+		ModelID:               "gpt-4o",
 		Provider:              "openai",
 		InputPricePerMillion:  5.00,
 		OutputPricePerMillion: 15.00,
@@ -438,7 +438,7 @@ func (s *Service) loadDefaultModelConfigs() {
 }
 
 // GetModelConfig gets the configuration for a specific model
-func (s *Service) GetModelConfig(modelID string) (ModelConfig, error) {
+func (s *PricingService) GetModelConfig(modelID string) (ModelConfig, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -455,7 +455,7 @@ func (s *Service) GetModelConfig(modelID string) (ModelConfig, error) {
 }
 
 // GetPricingTier gets a pricing tier by ID (for backward compatibility)
-func (s *Service) GetPricingTier(ctx context.Context, userID string) (PricingTier, error) {
+func (s *PricingService) GetPricingTier(ctx context.Context, userID string) (PricingTier, error) {
 	// Get user from Firebase
 	user, err := s.firebaseService.GetUserByID(ctx, userID)
 	if err != nil {
@@ -497,7 +497,7 @@ func (s *Service) GetPricingTier(ctx context.Context, userID string) (PricingTie
 }
 
 // CalculateCost calculates the cost for a request with percentage-based markup
-func (s *Service) CalculateCost(ctx context.Context, userID, modelID string, inputTokens, outputTokens int) (float64, float64, error) {
+func (s *PricingService) CalculateCost(ctx context.Context, userID, modelID string, inputTokens, outputTokens int) (float64, float64, error) {
 	// Get user from Firebase
 	user, err := s.firebaseService.GetUserByID(ctx, userID)
 	if err != nil {
@@ -529,7 +529,7 @@ func (s *Service) CalculateCost(ctx context.Context, userID, modelID string, inp
 }
 
 // CalculateSavingsFee calculates the savings fee based on tokens saved
-func (s *Service) CalculateSavingsFee(tier PricingTier, inputTokensSaved, outputTokensSaved int) float64 {
+func (s *PricingService) CalculateSavingsFee(tier PricingTier, inputTokensSaved, outputTokensSaved int) float64 {
 	// Calculate savings based on the tier's markup percentages
 	inputSavings := float64(inputTokensSaved) * (tier.InputMarkupPercent / 100) / 1000000
 	outputSavings := float64(outputTokensSaved) * (tier.OutputMarkupPercent / 100) / 1000000
@@ -538,7 +538,7 @@ func (s *Service) CalculateSavingsFee(tier PricingTier, inputTokensSaved, output
 }
 
 // RefreshCache refreshes the cached data
-func (s *Service) RefreshCache(ctx context.Context) error {
+func (s *PricingService) RefreshCache(ctx context.Context) error {
 	slog.Info("Refreshing pricing cache")
 
 	// Try to reload model configurations from Firestore first
@@ -560,14 +560,14 @@ func (s *Service) RefreshCache(ctx context.Context) error {
 }
 
 // shouldRefreshCache checks if the cache should be refreshed
-func (s *Service) shouldRefreshCache() bool {
+func (s *PricingService) shouldRefreshCache() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return time.Since(s.lastRefresh) > s.cacheTTL
 }
 
 // GetCacheStats returns cache statistics
-func (s *Service) GetCacheStats() map[string]interface{} {
+func (s *PricingService) GetCacheStats() map[string]interface{} {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -580,12 +580,12 @@ func (s *Service) GetCacheStats() map[string]interface{} {
 }
 
 // LoadDefaultModelConfigs loads the default model configurations (for testing)
-func (s *Service) LoadDefaultModelConfigs() {
+func (s *PricingService) LoadDefaultModelConfigs() {
 	s.loadDefaultModelConfigs()
 }
 
 // loadModelConfigsFromFirestore loads model configurations from Firestore
-func (s *Service) loadModelConfigsFromFirestore(ctx context.Context) error {
+func (s *PricingService) loadModelConfigsFromFirestore(ctx context.Context) error {
 	iter := s.firebaseService.DB().Collection("model_configurations").Documents(ctx)
 	defer iter.Stop()
 
@@ -619,7 +619,7 @@ func (s *Service) loadModelConfigsFromFirestore(ctx context.Context) error {
 }
 
 // loadPricingTiersFromFirestore loads pricing tiers from Firestore
-func (s *Service) loadPricingTiersFromFirestore(ctx context.Context) error {
+func (s *PricingService) loadPricingTiersFromFirestore() error {
 	// This method is a placeholder for future implementation
 	// Currently, pricing tiers are loaded on-demand from Firebase
 	slog.Info("Pricing tiers will be loaded on-demand from Firestore")

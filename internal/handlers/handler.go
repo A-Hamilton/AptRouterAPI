@@ -1,37 +1,37 @@
-package api
+package handlers
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/apt-router/api/internal/config"
-	"github.com/apt-router/api/internal/firebase"
-	"github.com/apt-router/api/internal/pricing"
+	"github.com/apt-router/api/internal/data"
+	"github.com/apt-router/api/internal/services"
+	"github.com/apt-router/api/internal/utils"
 	"github.com/gin-gonic/gin"
 	"github.com/patrickmn/go-cache"
 )
 
 // Handler handles all API requests
 type Handler struct {
-	config            *config.Config
-	firebaseService   *firebase.Service
+	config            *utils.Config
+	firebaseService   *data.Service
 	cache             *cache.Cache
-	pricingService    *pricing.Service
-	generationService *GenerationService
+	pricingService    *services.PricingService
+	generationService *services.GenerationService
 }
 
 // NewHandler creates a new API handler
 func NewHandler(
-	cfg *config.Config,
-	firebaseService *firebase.Service,
+	cfg *utils.Config,
+	firebaseService *data.Service,
 	cache *cache.Cache,
-	pricingService *pricing.Service,
+	pricingService *services.PricingService,
 ) *Handler {
-	generationService := NewGenerationService(cfg, firebaseService, cache, pricingService)
+	generationService := services.NewGenerationService(cfg, firebaseService, cache, pricingService)
 
 	return &Handler{
 		config:            cfg,
@@ -83,12 +83,12 @@ func (h *Handler) AuthMiddleware() gin.HandlerFunc {
 		logger.Info("API key authentication", "key_hash", keyHash[:8]+"...")
 
 		// Get user from Firebase (for development, use mock user)
-		var user *firebase.User
+		var user *data.User
 		var err error
 
 		if apiKey == "mock-api-key-for-development" {
 			// Create mock user for development
-			user = &firebase.User{
+			user = &data.User{
 				ID:            "mock-user-id",
 				Email:         "dev@example.com",
 				Balance:       100.0,
@@ -136,7 +136,7 @@ func (h *Handler) AuthMiddleware() gin.HandlerFunc {
 			RequestID: requestID,
 			UserID:    user.ID,
 			APIKeyID:  keyHash,
-			PricingTier: pricing.PricingTier{
+			PricingTier: services.PricingTier{
 				ID:                  tier.ID,
 				TierName:            tier.TierName,
 				MinMonthlySpend:     tier.MinMonthlySpend,
@@ -214,6 +214,7 @@ func (h *Handler) Generate(c *gin.Context) {
 		})
 		return
 	}
+	requestCtx.Logger.Info("Handler entered", "request_id", requestCtx.RequestID, "timestamp", time.Now().Format(time.RFC3339Nano))
 
 	// Parse request
 	var req GenerateRequest
@@ -225,7 +226,7 @@ func (h *Handler) Generate(c *gin.Context) {
 	}
 
 	// Convert HTTP request to service request
-	serviceReq := &GenerationRequest{
+	serviceReq := &services.GenerationRequest{
 		Model:            req.Model,
 		Prompt:           req.Prompt,
 		MaxTokens:        h.getIntValue(req.MaxTokens, 1000),
@@ -240,11 +241,18 @@ func (h *Handler) Generate(c *gin.Context) {
 	}
 
 	// Call service layer
-	result, err := h.generationService.Generate(c.Request.Context(), serviceReq, requestCtx)
+	result, err := h.generationService.Generate(c.Request.Context(), serviceReq, &services.RequestContext{
+		RequestID:   requestCtx.RequestID,
+		UserID:      requestCtx.UserID,
+		APIKeyID:    requestCtx.APIKeyID,
+		PricingTier: requestCtx.PricingTier,
+		Logger:      requestCtx.Logger,
+		CachedUser:  convertCachedUserData(requestCtx.CachedUser),
+	})
 	if err != nil {
-		requestCtx.Logger.Error("Generation failed", "error", err)
+		requestCtx.Logger.Error("Generation failed", "error", err, "model", req.Model, "provider", "openai")
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": err.Error(),
+			"error": fmt.Sprintf("Generation failed: %v", err),
 		})
 		return
 	}
@@ -355,9 +363,9 @@ func (h *Handler) getBoolValue(ptr *bool, defaultValue bool) bool {
 }
 
 // logRequest logs the generation request to Firebase for audit purposes
-func (h *Handler) logRequest(ctx context.Context, requestCtx *RequestContext, req *GenerationRequest, result *GenerationResult, totalCost, markupAmount float64, startTime, endTime time.Time, streaming bool) error {
+func (h *Handler) logRequest(ctx context.Context, requestCtx *RequestContext, req *services.GenerationRequest, result *services.GenerationResult, totalCost, markupAmount float64, startTime, endTime time.Time, streaming bool) error {
 	// Create request log
-	log := &firebase.RequestLog{
+	log := &data.RequestLog{
 		ID:                 requestCtx.RequestID,
 		UserID:             requestCtx.UserID,
 		APIKeyID:           requestCtx.APIKeyID,
@@ -408,6 +416,7 @@ func (h *Handler) GenerateStream(c *gin.Context) {
 		})
 		return
 	}
+	requestCtx.Logger.Info("Streaming handler entered", "request_id", requestCtx.RequestID, "timestamp", time.Now().Format(time.RFC3339Nano))
 
 	// Parse request
 	var req GenerateRequest
@@ -419,7 +428,7 @@ func (h *Handler) GenerateStream(c *gin.Context) {
 	}
 
 	// Convert HTTP request to service request
-	serviceReq := &GenerationRequest{
+	serviceReq := &services.GenerationRequest{
 		Model:            req.Model,
 		Prompt:           req.Prompt,
 		MaxTokens:        h.getIntValue(req.MaxTokens, 1000),
@@ -433,163 +442,57 @@ func (h *Handler) GenerateStream(c *gin.Context) {
 		OptimizationMode: req.OptimizationMode,
 	}
 
+	// Set up streaming response headers immediately
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Request-ID", requestCtx.RequestID)
+
 	// Call service layer for streaming
-	streamResp, err := h.generationService.GenerateStream(c.Request.Context(), serviceReq, requestCtx)
+	streamResp, err := h.generationService.GenerateStream(c.Request.Context(), serviceReq, &services.RequestContext{
+		RequestID:   requestCtx.RequestID,
+		UserID:      requestCtx.UserID,
+		APIKeyID:    requestCtx.APIKeyID,
+		PricingTier: requestCtx.PricingTier,
+		Logger:      requestCtx.Logger,
+		CachedUser:  convertCachedUserData(requestCtx.CachedUser),
+	})
 	if err != nil {
 		requestCtx.Logger.Error("Streaming generation failed", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": err.Error(),
-		})
+		// Don't try to write to the response if the stream failed to start
+		// just return since the connection might be closed.
 		return
 	}
 
-	// Set headers for streaming (all available before streaming)
-	if streamResp.Metadata != nil {
-		if inputTokens, ok := streamResp.Metadata["input_tokens"]; ok {
-			c.Header("X-Input-Tokens", inputTokens)
-		}
-		if wasOptimized, ok := streamResp.Metadata["was_optimized"]; ok {
-			c.Header("X-Was-Optimized", wasOptimized)
-		}
-		if optimizationStatus, ok := streamResp.Metadata["optimization_status"]; ok {
-			c.Header("X-Optimization-Status", optimizationStatus)
-		}
-	}
-
-	// Set up streaming response headers
-	c.Header("Content-Type", "text/plain; charset=utf-8")
-	c.Header("Transfer-Encoding", "chunked")
-	c.Writer.WriteHeader(http.StatusOK)
-	c.Writer.Flush()
-
-	// Stream the response in real-time
-	buffer := make([]byte, 1024)
-	var fullResponse strings.Builder
-
-	for {
-		n, err := streamResp.Stream.Read(buffer)
+	// Use c.Stream for a more robust streaming implementation
+	c.Stream(func(w io.Writer) bool {
+		buf := make([]byte, 1024)
+		n, err := streamResp.Stream.Read(buf)
 		if n > 0 {
-			chunk := string(buffer[:n])
-
-			// Accumulate the full response for processing
-			fullResponse.WriteString(chunk)
-
-			// Send this chunk immediately to the user
-			c.Writer.Write(buffer[:n])
-			c.Writer.Flush() // Force immediate transmission
+			// SSE format: data: <json-payload>\n\n
+			data := fmt.Sprintf("data: %s\n\n", string(buf[:n]))
+			if _, writeErr := w.Write([]byte(data)); writeErr != nil {
+				requestCtx.Logger.Error("Failed to write chunk to stream", "error", writeErr)
+				return false // Stop streaming
+			}
 		}
+
 		if err != nil {
-			if err.Error() == "EOF" {
-				break
+			if err != io.EOF {
+				requestCtx.Logger.Error("Streaming: Read error from source", "error", err)
+			} else {
+				requestCtx.Logger.Info("Streaming: EOF reached from source")
 			}
-			requestCtx.Logger.Error("Stream read error", "error", err)
-			break
-		}
-	}
-
-	// Close the stream (this will trigger usage logging in EnhancedStreamReader)
-	streamResp.Stream.Close()
-
-	// Get the full response content
-	fullContent := fullResponse.String()
-
-	// Parse saved_tokens estimate from the response if present
-	savedTokensEstimate := 0
-	cleanedContent := fullContent
-	if idx := strings.LastIndex(fullContent, "saved_tokens="); idx != -1 {
-		startIdx := idx + len("saved_tokens=")
-		endIdx := startIdx
-		for endIdx < len(fullContent) && fullContent[endIdx] >= '0' && fullContent[endIdx] <= '9' {
-			endIdx++
-		}
-		if endIdx > startIdx {
-			if estimate, err := strconv.Atoi(fullContent[startIdx:endIdx]); err == nil {
-				savedTokensEstimate = estimate
-				requestCtx.Logger.Info("Parsed saved_tokens estimate from response", "estimate", savedTokensEstimate)
-			}
-		}
-		// Remove the saved_tokens pattern from the content
-		cleanedContent = strings.TrimSpace(fullContent[:idx])
-
-		// Send a backspace sequence to remove the saved_tokens pattern from the user's view
-		// This is a bit hacky but works for terminal output
-		backspaceCount := len(fullContent) - len(cleanedContent)
-		if backspaceCount > 0 {
-			backspaceSequence := strings.Repeat("\b \b", backspaceCount)
-			c.Writer.Write([]byte(backspaceSequence))
-			c.Writer.Flush()
-		}
-	}
-
-	// After streaming, set output token and optimization headers if possible
-	if enhanced, ok := streamResp.Stream.(*EnhancedStreamReader); ok {
-		requestCtx.Logger.Info("Setting optimization headers",
-			"output_tokens", enhanced.outputTokens,
-			"has_optimization_result", enhanced.promptOptimizationResult != nil)
-
-		c.Header("X-Output-Tokens", fmt.Sprintf("%d", enhanced.outputTokens))
-		if enhanced.promptOptimizationResult != nil {
-			requestCtx.Logger.Info("Setting optimization result headers",
-				"original_tokens", enhanced.promptOptimizationResult.OriginalTokens,
-				"tokens_saved", enhanced.promptOptimizationResult.TokensSaved)
-			c.Header("X-Input-Tokens-Original", fmt.Sprintf("%d", enhanced.promptOptimizationResult.OriginalTokens))
-			c.Header("X-Input-Tokens-Saved", fmt.Sprintf("%d", enhanced.promptOptimizationResult.TokensSaved))
-		} else {
-			// Set default values if no optimization result
-			c.Header("X-Input-Tokens-Original", fmt.Sprintf("%d", enhanced.inputTokens))
-			c.Header("X-Input-Tokens-Saved", "0")
+			// Stop streaming on any error, including EOF
+			return false
 		}
 
-		// Calculate total cost using the generation service
-		totalCost := h.generationService.calculateCost(enhanced.inputTokens, enhanced.outputTokens, enhanced.modelConfig, requestCtx.PricingTier)
+		return true // Continue streaming
+	})
 
-		// Create metadata for logging and headers (not sent to user)
-		metadata := map[string]interface{}{
-			"input_tokens":        enhanced.inputTokens,
-			"output_tokens":       enhanced.outputTokens,
-			"total_tokens":        enhanced.inputTokens + enhanced.outputTokens,
-			"cost":                totalCost,
-			"was_optimized":       enhanced.wasOptimized,
-			"optimization_status": enhanced.optimizationStatus,
-			"fallback_reason":     enhanced.fallbackReason,
-		}
-
-		if enhanced.promptOptimizationResult != nil {
-			metadata["input_tokens_original"] = enhanced.promptOptimizationResult.OriginalTokens
-			metadata["tokens_saved"] = enhanced.promptOptimizationResult.TokensSaved
-		} else {
-			metadata["input_tokens_original"] = enhanced.inputTokens
-			metadata["tokens_saved"] = 0
-		}
-
-		// Add output optimization estimate if available
-		if savedTokensEstimate > 0 {
-			metadata["output_tokens_saved_estimate"] = savedTokensEstimate
-		}
-
-		// Log the metadata instead of sending it to user
-		requestCtx.Logger.Info("Streaming metadata", "metadata", metadata)
-
-		// Set additional headers with metadata info
-		c.Header("X-Total-Tokens", fmt.Sprintf("%d", enhanced.inputTokens+enhanced.outputTokens))
-		c.Header("X-Cost", fmt.Sprintf("%.6f", totalCost))
-		c.Header("X-Was-Optimized", fmt.Sprintf("%t", enhanced.wasOptimized))
-		c.Header("X-Optimization-Status", enhanced.optimizationStatus)
-		if enhanced.fallbackReason != "" {
-			c.Header("X-Fallback-Reason", enhanced.fallbackReason)
-		}
-		if savedTokensEstimate > 0 {
-			c.Header("X-Output-Tokens-Saved-Estimate", fmt.Sprintf("%d", savedTokensEstimate))
-		}
-
-		// Log the streaming request completion
-		requestCtx.Logger.Info("Streaming request completed",
-			"user_id", requestCtx.UserID,
-			"model", req.Model,
-			"streaming", true,
-			"duration_ms", time.Since(startTime).Milliseconds(),
-		)
-	}
+	requestCtx.Logger.Info("Streaming request completed", "request_id", requestCtx.RequestID, "duration_ms", time.Since(startTime).Milliseconds())
+	// Note: Full request logging (with token counts, cost, etc.) is more complex for streams.
+	// This would typically be handled by the generation service after the stream is fully consumed.
 }
 
 // GetProfile handles getting user profile
@@ -638,4 +541,20 @@ func (h *Handler) RevokeAPIKey(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"message": "RevokeAPIKey endpoint - not implemented yet",
 	})
+}
+
+// convertCachedUserData converts handlers.CachedUserData to services.CachedUserData
+func convertCachedUserData(cachedUser *CachedUserData) *services.CachedUserData {
+	if cachedUser == nil {
+		return nil
+	}
+	return &services.CachedUserData{
+		ID:            cachedUser.ID,
+		Email:         cachedUser.Email,
+		Balance:       cachedUser.Balance,
+		TierID:        cachedUser.TierID,
+		IsActive:      cachedUser.IsActive,
+		CustomPricing: cachedUser.CustomPricing,
+		LastUpdated:   cachedUser.LastUpdated,
+	}
 }

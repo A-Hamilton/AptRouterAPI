@@ -1,4 +1,4 @@
-package llm
+package data
 
 import (
 	"context"
@@ -10,7 +10,6 @@ import (
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	ssestream "github.com/anthropics/anthropic-sdk-go/packages/ssestream"
-	"github.com/pkoukk/tiktoken-go"
 )
 
 // AnthropicClient implements LLMClient for Anthropic
@@ -119,14 +118,20 @@ func (c *AnthropicClient) GenerateWithParams(ctx context.Context, params map[str
 
 	slog.Info("Anthropic client: Response received", "model", c.modelID, "response_length", len(responseText))
 
-	inputTokens, err := c.CountTokens(prompt)
-	if err != nil {
-		slog.Warn("Failed to count input tokens", "error", err)
+	// Use actual token usage from provider response if available
+	var inputTokens, outputTokens int
+	if resp.Usage.InputTokens > 0 || resp.Usage.OutputTokens > 0 {
+		// Use actual token counts from Anthropic response
+		inputTokens = int(resp.Usage.InputTokens)
+		outputTokens = int(resp.Usage.OutputTokens)
+		slog.Info("Anthropic client: Using actual token usage from provider",
+			"input_tokens", inputTokens, "output_tokens", outputTokens)
+	} else {
+		// CRITICAL: No fallback to tokenizer estimates - we must use real API usage data
+		slog.Warn("Anthropic client: No usage data provided by API - cannot calculate accurate token counts",
+			"input_tokens", 0, "output_tokens", 0,
+			"note", "Using real API usage data only, no estimators allowed")
 		inputTokens = 0
-	}
-	outputTokens, err := c.CountTokens(responseText)
-	if err != nil {
-		slog.Warn("Failed to count output tokens", "error", err)
 		outputTokens = 0
 	}
 
@@ -134,7 +139,11 @@ func (c *AnthropicClient) GenerateWithParams(ctx context.Context, params map[str
 		Text:         responseText,
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
-		Usage:        nil,
+		Usage: &UsageInfo{
+			PromptTokens:     inputTokens,
+			CompletionTokens: outputTokens,
+			TotalTokens:      inputTokens + outputTokens,
+		},
 		FinishReason: "end_turn",
 		ModelID:      c.modelID,
 		Provider:     "anthropic",
@@ -209,9 +218,14 @@ type AnthropicStreamReader struct {
 	buffer []byte
 	pos    int
 	closed bool
+	// Usage tracking
+	inputTokens  int
+	outputTokens int
+	usageFound   bool
 }
 
 func (r *AnthropicStreamReader) Read(p []byte) (n int, err error) {
+	slog.Info("AnthropicStreamReader: Read called", "closed", r.closed, "pos", r.pos, "buffer_len", len(r.buffer))
 	if r.closed {
 		return 0, io.EOF
 	}
@@ -223,6 +237,7 @@ func (r *AnthropicStreamReader) Read(p []byte) (n int, err error) {
 			r.buffer = nil
 			r.pos = 0
 		}
+		slog.Info("AnthropicStreamReader: Returning buffered content", "n", n)
 		return n, nil
 	}
 
@@ -238,14 +253,39 @@ func (r *AnthropicStreamReader) Read(p []byte) (n int, err error) {
 	}
 
 	event := r.stream.Current()
-	slog.Debug("AnthropicStreamReader: Received event", "event_type", fmt.Sprintf("%T", event))
+	slog.Info("AnthropicStreamReader: Event received", "event_type", fmt.Sprintf("%T", event))
+
+	// Check for usage information in the final chunk
+	// Anthropic provides usage data in the final message event
+	if !r.usageFound {
+		// Use reflection to check for usage data in the event
+		eventValue := reflect.ValueOf(event)
+		if eventValue.Kind() == reflect.Ptr {
+			eventValue = eventValue.Elem()
+		}
+
+		// Look for usage fields
+		if usageField := eventValue.FieldByName("Usage"); usageField.IsValid() {
+			if inputField := usageField.FieldByName("InputTokens"); inputField.IsValid() && inputField.Kind() == reflect.Int64 {
+				r.inputTokens = int(inputField.Int())
+			}
+			if outputField := usageField.FieldByName("OutputTokens"); outputField.IsValid() && outputField.Kind() == reflect.Int64 {
+				r.outputTokens = int(outputField.Int())
+			}
+			if r.inputTokens > 0 || r.outputTokens > 0 {
+				r.usageFound = true
+				slog.Info("Anthropic streaming: Captured usage from final chunk",
+					"input_tokens", r.inputTokens, "output_tokens", r.outputTokens)
+			}
+		}
+	}
 
 	var content string
 
 	// Try to extract content using reflection and type assertions
 	if textEvent, ok := any(event).(interface{ GetText() string }); ok {
 		content = textEvent.GetText()
-		slog.Debug("AnthropicStreamReader: Extracted text via GetText()", "content_length", len(content))
+		slog.Info("AnthropicStreamReader: Content extracted via GetText", "content", content)
 	}
 
 	// If no content found, try to extract from the event structure
@@ -260,14 +300,14 @@ func (r *AnthropicStreamReader) Read(p []byte) (n int, err error) {
 		if deltaField := eventValue.FieldByName("Delta"); deltaField.IsValid() {
 			if textField := deltaField.FieldByName("Text"); textField.IsValid() && textField.Kind() == reflect.String {
 				content = textField.String()
-				slog.Debug("AnthropicStreamReader: Extracted text from Delta.Text", "content_length", len(content))
+				slog.Info("AnthropicStreamReader: Content extracted from Delta.Text", "content", content)
 			}
 		}
 
 		if contentField := eventValue.FieldByName("Content"); contentField.IsValid() {
 			if textField := contentField.FieldByName("Text"); textField.IsValid() && textField.Kind() == reflect.String {
 				content = textField.String()
-				slog.Debug("AnthropicStreamReader: Extracted text from Content.Text", "content_length", len(content))
+				slog.Info("AnthropicStreamReader: Content extracted from Content.Text", "content", content)
 			}
 		}
 	}
@@ -287,7 +327,7 @@ func (r *AnthropicStreamReader) Read(p []byte) (n int, err error) {
 		r.pos = 0
 	}
 
-	slog.Debug("AnthropicStreamReader: Extracted content", "content_length", len(content), "content_preview", content[:min(len(content), 50)])
+	slog.Info("AnthropicStreamReader: Returning new content", "n", n, "content", content)
 	return n, nil
 }
 
@@ -296,14 +336,7 @@ func (r *AnthropicStreamReader) Close() error {
 	return nil
 }
 
-// CountTokens counts tokens using tiktoken
-func (c *AnthropicClient) CountTokens(text string) (int, error) {
-	// Get encoding for the model - Anthropic uses cl100k_base like OpenAI
-	encoding, err := tiktoken.GetEncoding("cl100k_base")
-	if err != nil {
-		return 0, fmt.Errorf("failed to get encoding: %w", err)
-	}
-
-	tokens := encoding.Encode(text, nil, nil)
-	return len(tokens), nil
+// GetUsage returns the captured usage information
+func (r *AnthropicStreamReader) GetUsage() (int, int) {
+	return r.inputTokens, r.outputTokens
 }

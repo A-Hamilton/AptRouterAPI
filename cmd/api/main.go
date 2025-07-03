@@ -9,10 +9,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/apt-router/api/internal/api"
-	"github.com/apt-router/api/internal/config"
-	"github.com/apt-router/api/internal/firebase"
-	"github.com/apt-router/api/internal/pricing"
+	"github.com/apt-router/api/internal/data"
+	"github.com/apt-router/api/internal/handlers"
+	"github.com/apt-router/api/internal/services"
+	"github.com/apt-router/api/internal/utils"
 	"github.com/gin-gonic/gin"
 	"github.com/patrickmn/go-cache"
 )
@@ -20,7 +20,7 @@ import (
 // main is the entry point for the AptRouter API server
 func main() {
 	// Load configuration with timeout
-	cfg, err := config.LoadConfig()
+	cfg, err := utils.LoadConfig()
 	if err != nil {
 		slog.Error("Failed to load configuration", "error", err)
 		os.Exit(1)
@@ -46,7 +46,7 @@ func main() {
 	memoryCache := cache.New(cfg.Cache.DefaultExpiration, cfg.Cache.CleanupInterval)
 
 	// Initialize pricing service and pre-cache data with timeout
-	pricingService := pricing.NewService(firebaseService)
+	pricingService := services.NewPricingService(firebaseService)
 	pricingCtx, pricingCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer pricingCancel()
 
@@ -65,7 +65,7 @@ func main() {
 	router.Use(gin.Recovery())
 
 	// Initialize API handlers
-	apiHandler := api.NewHandler(cfg, firebaseService, memoryCache, pricingService)
+	apiHandler := handlers.NewHandler(cfg, firebaseService, memoryCache, pricingService)
 
 	// Add request logging middleware
 	router.Use(apiHandler.RequestLogger())
@@ -81,7 +81,7 @@ func main() {
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
 		// Performance optimizations
-		MaxHeaderBytes: 1 << 20, // 1MB
+		MaxHeaderBytes: 128 * 1024, // 128KB
 	}
 
 	// Start server in a goroutine
@@ -113,7 +113,7 @@ func main() {
 }
 
 // initLogger initializes the structured logger based on configuration
-func initLogger(cfg *config.Config) *slog.Logger {
+func initLogger(cfg *utils.Config) *slog.Logger {
 	var level slog.Level
 	switch cfg.Logging.Level {
 	case "debug":
@@ -143,16 +143,16 @@ func initLogger(cfg *config.Config) *slog.Logger {
 }
 
 // initFirebaseService initializes the Firebase service with timeout
-func initFirebaseService(cfg *config.Config) (*firebase.Service, error) {
+func initFirebaseService(cfg *utils.Config) (*data.Service, error) {
 	// Create Firebase config
-	firebaseConfig := &firebase.FirebaseConfig{
+	firebaseConfig := &data.FirebaseConfig{
 		ProjectID:          cfg.Firebase.ProjectID,
 		ServiceAccountPath: cfg.Firebase.ServiceAccountPath,
 		UseCLIAuth:         cfg.Firebase.UseCLIAuth,
 	}
 
 	// Initialize Firebase service
-	service, err := firebase.NewService(firebaseConfig)
+	service, err := data.NewService(firebaseConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +166,7 @@ func initFirebaseService(cfg *config.Config) (*firebase.Service, error) {
 }
 
 // testFirebaseConnection tests the Firebase connection
-func testFirebaseConnection(ctx context.Context, service *firebase.Service) error {
+func testFirebaseConnection(ctx context.Context, service *data.Service) error {
 	// Simple health check - try to get default pricing tier
 	_, err := service.GetDefaultPricingTier(ctx)
 	if err != nil {
@@ -177,7 +177,7 @@ func testFirebaseConnection(ctx context.Context, service *firebase.Service) erro
 }
 
 // registerRoutes registers all API routes with proper grouping
-func registerRoutes(router *gin.Engine, handler *api.Handler) {
+func registerRoutes(router *gin.Engine, handler *handlers.Handler) {
 	// Health check endpoint
 	router.GET("/healthz", handler.HealthCheck)
 

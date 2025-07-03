@@ -1,15 +1,14 @@
-package llm
+package data
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"io"
 	"log/slog"
 	"reflect"
 
 	openai "github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
-	"github.com/pkoukk/tiktoken-go"
 )
 
 // OpenAIClient implements LLMClient for OpenAI
@@ -61,12 +60,32 @@ func (c *OpenAIClient) GenerateWithParams(ctx context.Context, params map[string
 		Temperature: openai.Float(temperature),
 	})
 	if err != nil {
-		slog.Error("OpenAI client: API call failed", "error", err, "model", c.modelID)
+		// Try to extract structured error info
+		var apiErr *openai.Error
+		statusCode := 0
+		errCode := ""
+		msg := err.Error()
+		if errors.As(err, &apiErr) {
+			statusCode = apiErr.StatusCode
+			errCode = apiErr.Code
+			if apiErr.Message != "" {
+				msg = apiErr.Message
+			}
+		}
+		// Determine retryability
+		retryable := true
+		if statusCode == 401 || statusCode == 402 || statusCode == 403 || statusCode == 404 || statusCode == 429 {
+			retryable = false
+		} else if statusCode >= 500 && statusCode < 600 {
+			retryable = true
+		}
 		return nil, &ProviderError{
-			Provider:  "openai",
-			ModelID:   c.modelID,
-			Message:   fmt.Sprintf("API call failed: %v", err),
-			Retryable: true,
+			Provider:   "openai",
+			ModelID:    c.modelID,
+			StatusCode: statusCode,
+			ErrorCode:  errCode,
+			Message:    msg,
+			Retryable:  retryable,
 		}
 	}
 
@@ -84,14 +103,20 @@ func (c *OpenAIClient) GenerateWithParams(ctx context.Context, params map[string
 	responseText := resp.Choices[0].Message.Content
 	slog.Info("OpenAI client: Response received", "model", c.modelID, "response_length", len(responseText))
 
-	inputTokens, err := c.CountTokens(prompt)
-	if err != nil {
-		slog.Warn("Failed to count input tokens", "error", err)
+	// Use actual token usage from provider response if available
+	var inputTokens, outputTokens int
+	if resp.Usage.PromptTokens > 0 || resp.Usage.CompletionTokens > 0 {
+		// Use actual token counts from OpenAI response
+		inputTokens = int(resp.Usage.PromptTokens)
+		outputTokens = int(resp.Usage.CompletionTokens)
+		slog.Info("OpenAI client: Using actual token usage from provider",
+			"input_tokens", inputTokens, "output_tokens", outputTokens)
+	} else {
+		// CRITICAL: No fallback to tokenizer estimates - we must use real API usage data
+		slog.Warn("OpenAI client: No usage data provided by API - cannot calculate accurate token counts",
+			"input_tokens", 0, "output_tokens", 0,
+			"note", "Using real API usage data only, no estimators allowed")
 		inputTokens = 0
-	}
-	outputTokens, err := c.CountTokens(responseText)
-	if err != nil {
-		slog.Warn("Failed to count output tokens", "error", err)
 		outputTokens = 0
 	}
 
@@ -99,7 +124,11 @@ func (c *OpenAIClient) GenerateWithParams(ctx context.Context, params map[string
 		Text:         responseText,
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
-		Usage:        nil, // Optionally map resp.Usage
+		Usage: &UsageInfo{
+			PromptTokens:     inputTokens,
+			CompletionTokens: outputTokens,
+			TotalTokens:      inputTokens + outputTokens,
+		},
 		FinishReason: string(resp.Choices[0].FinishReason),
 		ModelID:      c.modelID,
 		Provider:     "openai",
@@ -132,14 +161,30 @@ func (c *OpenAIClient) GenerateStream(ctx context.Context, params map[string]int
 	slog.Info("OpenAI client: Creating streaming client", "model", c.modelID, "prompt_length", len(prompt))
 
 	client := openai.NewClient(option.WithAPIKey(c.apiKey))
-	stream := client.Chat.Completions.NewStreaming(ctx, openai.ChatCompletionNewParams{
+
+	// Check if include_usage is requested
+	includeUsage := false
+	if includeUsageParam, ok := params["include_usage"].(bool); ok {
+		includeUsage = includeUsageParam
+	}
+
+	streamParams := openai.ChatCompletionNewParams{
 		Messages: []openai.ChatCompletionMessageParamUnion{
 			openai.UserMessage(prompt),
 		},
 		Model:       openai.ChatModel(c.modelID),
 		MaxTokens:   openai.Int(int64(maxTokens)),
 		Temperature: openai.Float(temperature),
-	})
+	}
+
+	// Add stream options if include_usage is requested
+	if includeUsage {
+		streamParams.StreamOptions = openai.ChatCompletionStreamOptionsParam{
+			IncludeUsage: openai.Bool(true),
+		}
+	}
+
+	stream := client.Chat.Completions.NewStreaming(ctx, streamParams)
 
 	streamReader := &OpenAIStreamReader{
 		stream:  stream,
@@ -162,6 +207,10 @@ type OpenAIStreamReader struct {
 	buffer  []byte
 	pos     int
 	closed  bool
+	// Usage tracking
+	inputTokens  int
+	outputTokens int
+	usageFound   bool
 }
 
 func (r *OpenAIStreamReader) Read(p []byte) (n int, err error) {
@@ -213,11 +262,23 @@ func (r *OpenAIStreamReader) Read(p []byte) (n int, err error) {
 		r.closed = true
 		return 0, io.EOF
 	}
-	// Type assert to openai.ChatCompletionChunk (not pointer)
+
+	// Type assert to openai.ChatCompletionChunk
 	chunk, ok := currentResult[0].Interface().(openai.ChatCompletionChunk)
 	if !ok {
 		return 0, nil
 	}
+
+	// Check for usage information in the final chunk
+	// According to OpenAI docs, when include_usage=true, the final chunk has usage data
+	if !r.usageFound && (chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0) {
+		r.inputTokens = int(chunk.Usage.PromptTokens)
+		r.outputTokens = int(chunk.Usage.CompletionTokens)
+		r.usageFound = true
+		slog.Info("OpenAI streaming: Captured usage from final chunk",
+			"input_tokens", r.inputTokens, "output_tokens", r.outputTokens)
+	}
+
 	var content string
 	if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
 		content = chunk.Choices[0].Delta.Content
@@ -241,14 +302,7 @@ func (r *OpenAIStreamReader) Close() error {
 	return nil
 }
 
-// CountTokens counts tokens using tiktoken
-func (c *OpenAIClient) CountTokens(text string) (int, error) {
-	// Get encoding for the model
-	encoding, err := tiktoken.GetEncoding("cl100k_base") // OpenAI uses cl100k_base
-	if err != nil {
-		return 0, fmt.Errorf("failed to get encoding: %w", err)
-	}
-
-	tokens := encoding.Encode(text, nil, nil)
-	return len(tokens), nil
+// GetUsage returns the captured usage information
+func (r *OpenAIStreamReader) GetUsage() (int, int) {
+	return r.inputTokens, r.outputTokens
 }

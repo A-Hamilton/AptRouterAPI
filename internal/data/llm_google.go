@@ -1,4 +1,4 @@
-package llm
+package data
 
 import (
 	"context"
@@ -7,7 +7,6 @@ import (
 	"iter"
 	"log/slog"
 
-	"github.com/pkoukk/tiktoken-go"
 	"google.golang.org/genai"
 )
 
@@ -74,34 +73,51 @@ func (c *GoogleClient) GenerateWithParams(ctx context.Context, params map[string
 	}
 
 	// Create content with text
-	content := []*genai.Content{
-		{
-			Parts: []*genai.Part{
-				{Text: prompt},
-			},
-		},
-	}
+	content := []*genai.Content{{
+		Parts: []*genai.Part{{Text: prompt}},
+	}}
 
-	slog.Info("Google client: Making API call", "model", c.modelID, "gemini_model", geminiModel)
-
-	// Generate content
-	result, err := client.Models.GenerateContent(ctx, geminiModel, content, nil)
+	// Call the Gemini API
+	resp, err := client.Models.GenerateContent(ctx, geminiModel, content, nil)
 	if err != nil {
-		slog.Error("Google client: API call failed", "error", err, "model", c.modelID)
+		// Try to extract status code and error code from error if possible
+		statusCode := 0
+		errCode := ""
+		msg := err.Error()
+		if apiErr, ok := err.(*genai.APIError); ok {
+			// apiErr.Code is the HTTP status code (int), apiErr.Message is the error message
+			statusCode = apiErr.Code
+			if statusCode < 100 || statusCode > 599 {
+				statusCode = 0 // unknown or not an HTTP status code
+			}
+			errCode = fmt.Sprintf("%d", apiErr.Code)
+			if apiErr.Message != "" {
+				msg = apiErr.Message
+			}
+		}
+		// Determine retryability
+		retryable := true
+		if statusCode == 401 || statusCode == 402 || statusCode == 403 || statusCode == 404 || statusCode == 429 {
+			retryable = false
+		} else if statusCode >= 500 && statusCode < 600 {
+			retryable = true
+		}
 		return nil, &ProviderError{
-			Provider:  "google",
-			ModelID:   c.modelID,
-			Message:   fmt.Sprintf("API call failed: %v", err),
-			Retryable: true,
+			Provider:   "google",
+			ModelID:    c.modelID,
+			StatusCode: statusCode,
+			ErrorCode:  errCode,
+			Message:    msg,
+			Retryable:  retryable,
 		}
 	}
 
-	slog.Info("Google client: API call successful", "model", c.modelID, "candidates_count", len(result.Candidates))
+	slog.Info("Google client: API call successful", "model", c.modelID, "candidates_count", len(resp.Candidates))
 
 	// Extract response text
 	responseText := ""
-	if len(result.Candidates) > 0 && len(result.Candidates[0].Content.Parts) > 0 {
-		responseText = result.Candidates[0].Content.Parts[0].Text
+	if len(resp.Candidates) > 0 && len(resp.Candidates[0].Content.Parts) > 0 {
+		responseText = resp.Candidates[0].Content.Parts[0].Text
 	}
 
 	if responseText == "" {
@@ -116,16 +132,20 @@ func (c *GoogleClient) GenerateWithParams(ctx context.Context, params map[string
 
 	slog.Info("Google client: Response received", "model", c.modelID, "response_length", len(responseText))
 
-	// Count tokens
-	inputTokens, err := c.CountTokens(prompt)
-	if err != nil {
-		slog.Warn("Failed to count input tokens", "error", err)
+	// Use actual token usage from provider response if available
+	var inputTokens, outputTokens int
+	if resp.UsageMetadata != nil && (resp.UsageMetadata.PromptTokenCount > 0 || resp.UsageMetadata.CandidatesTokenCount > 0) {
+		// Use actual token counts from Google response
+		inputTokens = int(resp.UsageMetadata.PromptTokenCount)
+		outputTokens = int(resp.UsageMetadata.CandidatesTokenCount)
+		slog.Info("Google client: Using actual token usage from provider",
+			"input_tokens", inputTokens, "output_tokens", outputTokens)
+	} else {
+		// CRITICAL: No fallback to tokenizer estimates - we must use real API usage data
+		slog.Warn("Google client: No usage data provided by API - cannot calculate accurate token counts",
+			"input_tokens", 0, "output_tokens", 0,
+			"note", "Using real API usage data only, no estimators allowed")
 		inputTokens = 0
-	}
-
-	outputTokens, err := c.CountTokens(responseText)
-	if err != nil {
-		slog.Warn("Failed to count output tokens", "error", err)
 		outputTokens = 0
 	}
 
@@ -133,7 +153,11 @@ func (c *GoogleClient) GenerateWithParams(ctx context.Context, params map[string
 		Text:         responseText,
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
-		Usage:        nil,
+		Usage: &UsageInfo{
+			PromptTokens:     inputTokens,
+			CompletionTokens: outputTokens,
+			TotalTokens:      inputTokens + outputTokens,
+		},
 		FinishReason: "STOP",
 		ModelID:      c.modelID,
 		Provider:     "google",
@@ -209,6 +233,10 @@ type GoogleStreamReader struct {
 	done chan struct{}
 	// Current error if any
 	currentError error
+	// Usage tracking
+	inputTokens  int
+	outputTokens int
+	usageFound   bool
 }
 
 func (r *GoogleStreamReader) Read(p []byte) (n int, err error) {
@@ -268,6 +296,53 @@ func (r *GoogleStreamReader) Read(p []byte) (n int, err error) {
 			return 0, io.EOF
 		}
 
+		// Check for usage information in the response
+		if !r.usageFound && resp.UsageMetadata != nil {
+			r.inputTokens = int(resp.UsageMetadata.PromptTokenCount)
+			r.outputTokens = int(resp.UsageMetadata.CandidatesTokenCount)
+			if r.inputTokens > 0 || r.outputTokens > 0 {
+				r.usageFound = true
+				slog.Info("Google streaming: Captured usage from response",
+					"input_tokens", r.inputTokens, "output_tokens", r.outputTokens)
+			}
+		}
+
+		// Also check if this is the final chunk (no more content) and we haven't found usage yet
+		if !r.usageFound && (len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0) {
+			// This might be the final chunk with usage data
+			if resp.UsageMetadata != nil {
+				r.inputTokens = int(resp.UsageMetadata.PromptTokenCount)
+				r.outputTokens = int(resp.UsageMetadata.CandidatesTokenCount)
+				if r.inputTokens > 0 || r.outputTokens > 0 {
+					r.usageFound = true
+					slog.Info("Google streaming: Captured usage from final chunk",
+						"input_tokens", r.inputTokens, "output_tokens", r.outputTokens)
+				}
+			}
+		}
+
+		// Log the response structure for debugging
+		if resp.UsageMetadata != nil {
+			slog.Debug("Google streaming: Found UsageMetadata",
+				"prompt_token_count", resp.UsageMetadata.PromptTokenCount,
+				"candidates_token_count", resp.UsageMetadata.CandidatesTokenCount,
+				"total_token_count", resp.UsageMetadata.TotalTokenCount)
+		} else {
+			slog.Debug("Google streaming: No UsageMetadata in response")
+		}
+
+		// Always check for usage metadata in every response - Google Gemini provides it
+		if resp.UsageMetadata != nil {
+			// Update usage data if we haven't found it yet or if this response has more complete data
+			if !r.usageFound || (resp.UsageMetadata.PromptTokenCount > 0 && resp.UsageMetadata.CandidatesTokenCount > 0) {
+				r.inputTokens = int(resp.UsageMetadata.PromptTokenCount)
+				r.outputTokens = int(resp.UsageMetadata.CandidatesTokenCount)
+				r.usageFound = true
+				slog.Info("Google streaming: Updated usage from response",
+					"input_tokens", r.inputTokens, "output_tokens", r.outputTokens)
+			}
+		}
+
 		if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
 			slog.Debug("GoogleStreamReader: No candidates or content parts in response")
 			return 0, nil
@@ -316,15 +391,7 @@ func (r *GoogleStreamReader) Close() error {
 	return nil
 }
 
-// CountTokens counts tokens using tiktoken
-func (c *GoogleClient) CountTokens(text string) (int, error) {
-	// Get encoding for the model - Google uses a different encoding
-	// For now, use cl100k_base as an approximation
-	encoding, err := tiktoken.GetEncoding("cl100k_base")
-	if err != nil {
-		return 0, fmt.Errorf("failed to get encoding: %w", err)
-	}
-
-	tokens := encoding.Encode(text, nil, nil)
-	return len(tokens), nil
+// GetUsage returns the captured usage information
+func (r *GoogleStreamReader) GetUsage() (int, int) {
+	return r.inputTokens, r.outputTokens
 }

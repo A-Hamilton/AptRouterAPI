@@ -1,4 +1,4 @@
-package api
+package handlers
 
 import (
 	"bytes"
@@ -6,50 +6,59 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
-	"github.com/apt-router/api/internal/config"
-	"github.com/apt-router/api/internal/pricing"
+	"github.com/apt-router/api/internal/data"
+	"github.com/apt-router/api/internal/services"
+	"github.com/apt-router/api/internal/utils"
 	"github.com/gin-gonic/gin"
 	"github.com/patrickmn/go-cache"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	supabase "github.com/supabase-community/supabase-go"
 )
 
 // setupTestHandler creates a test handler with mock dependencies
-func setupTestHandler(_ *testing.T) *Handler {
-	// Create mock config
-	cfg := &config.Config{
-		Server: config.ServerConfig{
+func setupTestHandler(t *testing.T) *Handler {
+	// Create test configuration
+	cfg := &utils.Config{
+		Server: utils.ServerConfig{
 			Port: 8080,
 			Env:  "test",
 		},
-		Security: config.SecurityConfig{
-			JWTSecret:  "test-secret",
-			APIKeySalt: "test-salt",
+		Firebase: utils.FirebaseConfig{
+			ProjectID:          "test-project",
+			ServiceAccountPath: "test-credentials.json",
 		},
-		LLM: config.LLMConfig{
+		Cache: utils.CacheConfig{
+			DefaultExpiration: 5 * time.Minute,
+			CleanupInterval:   10 * time.Minute,
+		},
+		LLM: utils.LLMConfig{
 			GoogleAPIKey:    "test-google-key",
 			OpenAIAPIKey:    "test-openai-key",
 			AnthropicAPIKey: "test-anthropic-key",
 		},
-		Optimization: config.OptimizationConfig{
-			Enabled:                       true,
-			FallbackOnOptimizationFailure: true,
+		Security: utils.SecurityConfig{
+			JWTSecret:  "test-jwt-secret",
+			APIKeySalt: "test-salt",
+		},
+		Logging: utils.LoggingConfig{
+			Level:  "info",
+			Format: "json",
 		},
 	}
 
-	// Create mock Supabase client (nil for tests)
-	var supabaseClient *supabase.Client
+	// Create mock Firebase service
+	firebaseService := &data.Service{}
 
-	// Create cache
-	memoryCache := cache.New(5, 10)
+	// Create memory cache
+	memoryCache := cache.New(5*time.Minute, 10*time.Minute)
 
 	// Create pricing service
-	pricingService := pricing.NewService(supabaseClient)
+	pricingService := services.NewPricingService(firebaseService)
 
 	// Create handler
-	handler := NewHandler(cfg, supabaseClient, memoryCache, pricingService)
+	handler := NewHandler(cfg, firebaseService, memoryCache, pricingService)
 
 	return handler
 }
